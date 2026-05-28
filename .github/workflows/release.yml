@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v1.0"
+        required: true
+        default: "v1.0"
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  windows:
+    name: Build Windows Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:RELEASE_TAG.TrimStart('v')
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            throw 'RELEASE_TAG is empty.'
+          }
+
+          $dist = Join-Path $PWD 'dist'
+          $portableRoot = Join-Path $dist "ruster-v$version-windows-x86_64-portable"
+          $singleExe = Join-Path $dist "ruster-v$version-windows-x86_64.exe"
+          $portableZip = Join-Path $dist "ruster-v$version-windows-x86_64-portable.zip"
+          $checksumFile = Join-Path $dist 'SHA256SUMS.txt'
+
+          if (Test-Path -LiteralPath $dist) {
+            Remove-Item -LiteralPath $dist -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $dist | Out-Null
+          New-Item -ItemType Directory -Path $portableRoot | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $portableRoot 'assets') | Out-Null
+
+          Copy-Item -LiteralPath 'target\release\ruster.exe' -Destination $singleExe -Force
+          Copy-Item -LiteralPath 'target\release\ruster.exe' -Destination (Join-Path $portableRoot 'ruster.exe') -Force
+          Copy-Item -LiteralPath 'README.md' -Destination (Join-Path $portableRoot 'README.md') -Force
+          Copy-Item -LiteralPath 'assets\prompts.json' -Destination (Join-Path $portableRoot 'assets\prompts.json') -Force
+
+          New-Item -ItemType File -Path (Join-Path $portableRoot 'ruster.portable') -Force | Out-Null
+          Set-Content -LiteralPath (Join-Path $portableRoot 'VERSION.txt') -Encoding UTF8 -Value @(
+            "ruster $env:RELEASE_TAG",
+            "Commit $env:GITHUB_SHA",
+            "Windows x86_64 release build"
+          )
+
+          Compress-Archive -Path (Join-Path $portableRoot '*') -DestinationPath $portableZip -Force
+
+          $assets = @($singleExe, $portableZip)
+          $checksums = foreach ($asset in $assets) {
+            $hash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $(Split-Path -Leaf $asset)"
+          }
+          Set-Content -LiteralPath $checksumFile -Encoding ASCII -Value $checksums
+
+          Get-ChildItem -LiteralPath $dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ruster ${{ env.RELEASE_TAG }}
+          draft: false
+          prerelease: false
+          make_latest: true
+          files: |
+            dist/ruster-*-windows-x86_64.exe
+            dist/ruster-*-windows-x86_64-portable.zip
+            dist/SHA256SUMS.txt
+          body: |
+            Windows release assets:
+
+            - `ruster-v<version>-windows-x86_64.exe`: single executable
+            - `ruster-v<version>-windows-x86_64-portable.zip`: portable package with `ruster.portable`
+            - `SHA256SUMS.txt`: checksums for both assets

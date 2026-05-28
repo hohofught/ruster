@@ -79,14 +79,25 @@ The default Custom API response shape is:
 }
 ```
 
-For ivLyrics, use the OpenAI-compatible endpoint when possible:
+### ivLyrics Setup
 
+ruster supports the ivLyrics `OpenAI ChatGPT` and `Google Gemini` addons.
+
+For the `OpenAI ChatGPT` addon:
+
+- API Key(s): the local API key shown in ruster, or any non-empty placeholder if local API key auth is disabled
 - Base URL: `http://127.0.0.1:5000/v1`
-- API Key: the local API key shown in ruster
-- Model: any model name accepted by ivLyrics, for example `gpt-4o-mini`
-- Chat Completions endpoint: `/chat/completions`
+- Model: select a model from the dropdown, or choose `Custom...` and set `Custom Model ID`
 
-ruster detects ivLyrics requests and rewrites translation/pronunciation prompts when useful. If `ivLyrics study/quiz CLI fast lane` is enabled, detected study, quiz, expression, summary, and line-study prompts are forwarded as the raw prompt received from the client. With the fast wrapper enabled, that path posts directly to Gemini Code Assist with a model-compatible `thinkingConfig` (`thinkingLevel` for Gemini 3 models, `thinkingBudget` for Gemini 2.5 models) and uses fail-fast request/empty-response attempts for lower latency. The path bypasses proxy deduplication and Gemini request gates for maximum throughput. When a WebView backend starts, ruster preloads the study CLI path in the background so the first study request does not pay the wrapper/auth/setup cost. WebView is not parallelized; it is used only as a serialized fallback for limit-like CLI failures when a WebView backend is available.
+For the `Google Gemini` addon:
+
+- API Key(s): the local API key shown in ruster, or any non-empty placeholder if local API key auth is disabled
+- Base URL: `http://127.0.0.1:5000/v1beta`
+- Model: select one of the models loaded from ruster
+
+Do not paste a full `/chat/completions` or `/models/{model}:generateContent` URL into the ivLyrics Base URL field. The addons append those paths themselves.
+
+Enable the ivLyrics features you want to route through ruster, then use `Test Connection`. In ruster, enable `ivLyrics study/quiz CLI fast lane` if you want study, quiz, expression, summary, and line-study prompts to go through the CLI-first path.
 
 ### Data Location
 
@@ -235,54 +246,79 @@ Content-Type: application/json
 
 ## ivLyrics 적용법
 
-ivLyrics에서 OpenAI 호환 번역기를 선택할 수 있다면 아래처럼 설정하는 것이 가장 간단합니다.
+ivLyrics 코드 기준으로는 `OpenAI ChatGPT` 애드온과 `Google Gemini` 애드온 둘 다 ruster에 연결할 수 있습니다. 둘 다 `API Key(s)`는 필수 입력이라, ruster의 `로컬 API 키 인증 요구`를 꺼 둔 경우에도 `localhost` 같은 비어 있지 않은 값을 넣어야 합니다. 인증을 켜 둔 경우에는 ruster 화면의 `로컬 API 키`를 그대로 넣습니다.
 
-- Base URL: `http://127.0.0.1:5000/v1`
-- API Key: ruster의 `로컬 API 키`
-- Model: `gpt-4o-mini` 또는 ivLyrics가 허용하는 임의 모델명
-- Chat Completions endpoint: `/chat/completions`
+### OpenAI ChatGPT 애드온
 
-Gemini 호환 번역기로 연결해야 한다면 아래 주소를 사용합니다.
+이 애드온은 `Base URL` 뒤에 `/chat/completions`를 붙여 요청하고, 모델 목록은 `/models`에서 가져옵니다. 따라서 `Base URL`에는 `/v1`까지만 넣습니다.
 
 ```text
-http://127.0.0.1:5000/v1beta/models/gemini-2.5-flash:generateContent?key=<local-api-key>
+Provider: OpenAI ChatGPT
+API Key(s): <ruster 로컬 API 키 또는 localhost>
+Base URL: http://localhost:5000/v1
+Model: <목록에서 선택> 또는 Custom...
+Custom Model ID: gpt-4o-mini
 ```
 
-ivLyrics가 단순 Custom API만 지원하는 경우:
+`Custom...`을 선택했다면 `Custom Model ID`를 비워 두면 안 됩니다. `gpt-4o-mini`, `gemini-3-flash-preview`, `gemini-2.5-flash`처럼 ruster가 받을 모델명을 넣습니다.
 
-- URL: `http://127.0.0.1:5000/translate`
-- Method: `POST`
-- Header: `Content-Type: application/json`
-- Header: `Authorization: Bearer <local-api-key>`
-- Body: `{"text":"<ivLyrics 원문 변수>","source":"auto","target":"ko"}`
-- Result path: `result`
+### Google Gemini 애드온
 
-ivLyrics 쪽 변수명은 버전마다 다를 수 있으므로, ivLyrics가 제공하는 원문/가사 변수를 위 예시의 `<ivLyrics 원문 변수>` 위치에 넣으면 됩니다.
-
-ruster는 ivLyrics 요청을 감지하면 번역/발음 프롬프트는 필요할 때 보정합니다. GUI의 `프롬프트 편집`에서 기본 규칙을 수정할 수 있고, 저장하면 데이터 폴더의 `prompts.json`에 반영됩니다. `ivLyrics 학습/퀴즈 CLI fast lane`을 켜면 학습, 퀴즈, 표현, 요약, 라인 학습 요청은 클라이언트에서 받은 원본 prompt 그대로 즉시 전달합니다. Fast wrapper가 켜져 있으면 Gemini Code Assist로 직접 POST하며, Gemini 3 계열은 `thinkingLevel`, Gemini 2.5 계열은 `thinkingBudget`을 모델 호환 형태로 붙입니다. 이 경로는 proxy dedup과 Gemini 요청 게이트를 우회하고, 내부 HTTP/빈 응답 재시도를 1회로 줄여 지연을 최소화합니다. WebView 백엔드가 시작되면 학습 CLI 경로를 백그라운드에서 preload해 첫 학습 요청의 wrapper/auth/setup 지연을 줄이고, CLI 요청 한도/429류 실패가 날 때만 WebView 모드에서 직렬 WebView fallback을 사용합니다.
-
-## Custom API 적용법
-
-프로그램 화면에서는 이 기능을 `호환 API`로 표시하지만, MORT의 Custom API 연결에는 그대로 사용할 수 있습니다.
-
-Custom API 설정 예시:
-
-- URL: `http://127.0.0.1:5000/translate`
-- Method: `POST`
-- Content-Type: `application/json`
-- 인증 헤더: `Authorization: Bearer <local-api-key>`
-- 요청 본문: `{"text":"<MORT OCR/원문 변수>","source":"auto","target":"ko"}`
-- 결과 경로: `result`
-
-MORT에서 헤더 설정이 불편하면 URL에 키를 붙여도 됩니다.
+이 애드온은 `Base URL` 뒤에 `/models?key=...`로 모델 목록을 읽고, 실제 요청은 `/models/{model}:generateContent?key=...`로 보냅니다. 따라서 `Base URL`에는 `/v1beta`까지만 넣습니다.
 
 ```text
-http://127.0.0.1:5000/translate?key=<local-api-key>
+Provider: Google Gemini
+API Key(s): <ruster 로컬 API 키 또는 localhost>
+Base URL: http://localhost:5000/v1beta
+Model: <목록에서 선택>
 ```
 
-로컬 키 인증을 쓰지 않을 환경이라면 ruster의 `서버 / 프록시`에서 `로컬 API 키 인증 요구`를 끄면 됩니다. 단, 외부 네트워크에서 접근 가능한 주소로 열어 둔 경우에는 인증을 끄지 않는 것이 좋습니다.
+`Base URL`에 `.../models/gemini-...:generateContent` 전체 주소를 넣으면 안 됩니다. ivLyrics Gemini 애드온이 그 경로를 직접 붙입니다.
 
-### Custom API 프리셋
+공통으로 필요한 기능 버튼을 켠 뒤 `Test Connection`을 눌러 확인합니다. ruster의 `프롬프트 / ivLyrics`에서 `ivLyrics 학습/퀴즈 CLI fast lane`을 켜면 학습, 퀴즈, 표현, 요약, 라인 학습 요청은 CLI 우선 경로로 처리됩니다.
+
+## MORT Custom API 적용법
+
+MORT의 기본 Custom API 모드는 아래 JSON을 `POST`로 보냅니다.
+
+```json
+{
+  "name": "<source><target>",
+  "text": "<OCR text>",
+  "target": "<target language code>",
+  "source": "<source language code>"
+}
+```
+
+ruster의 `/translate`는 이 형식을 그대로 받을 수 있습니다. MORT Custom API URL에는 아래처럼 넣습니다.
+
+```text
+http://127.0.0.1:5000/translate?key=<ruster 로컬 API 키>
+```
+
+ruster에서 `로컬 API 키 인증 요구`를 꺼 둔 경우에는 `?key=...`를 빼도 됩니다. MORT의 기본 Custom API 모드는 별도 헤더 입력 없이 `Content-Type: application/json`을 붙여 요청합니다.
+
+MORT 1.310 이상의 Custom API 프리셋을 쓰는 경우에는 아래처럼 넣습니다.
+
+- Url: `http://127.0.0.1:5000/translate?key=<ruster 로컬 API 키>`
+- Headers: 비워 둠
+- Request:
+
+```text
+"text": "{OCR_TEXT}",
+"source": "{SOURCE_CODE}",
+"target": "{RESULT_CODE}"
+```
+
+- Response:
+
+```text
+"result": {RESULT_TEXT}
+```
+
+MORT 프리셋의 `Request`는 바깥 `{}`를 생략해도 되고, `{OCR_TEXT}`, `{SOURCE_CODE}`, `{RESULT_CODE}`는 MORT가 치환합니다. `Response`는 `{RESULT_TEXT}`가 붙은 키 이름을 실제 응답 JSON에서 찾아 번역 결과로 사용합니다.
+
+### ruster Custom API 프리셋
 
 `/custom/{preset}` 경로를 쓰면 데이터 폴더의 `CustomApi` 디렉터리에 있는 프리셋을 적용합니다.
 
