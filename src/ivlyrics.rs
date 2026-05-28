@@ -248,24 +248,40 @@ pub fn strip_number_tags_from_response(response: &str) -> String {
 
 fn looks_like_translation_prompt(prompt: &str) -> bool {
     let lower = prompt.to_ascii_lowercase();
-    if lower.contains("you are a lyrics translator") && lower.contains("this is a translation task")
+    let has_input = Regex::new(r"(?im)^INPUT:\s*$").unwrap().is_match(prompt);
+    let has_output = Regex::new(r"(?im)^OUTPUT\s*\(").unwrap().is_match(prompt);
+    if !has_input || lower.contains("pronunciation") {
+        return false;
+    }
+
+    if lower.contains("you are a lyrics translator")
+        && (lower.contains("this is a translation task") || lower.contains("translate these"))
     {
         return true;
     }
-    let line_count = Regex::new(
+    let native_target = Regex::new(
         r"(?is)\bTranslate\s+these\s+\d+\s+lines\s+of\s+song\s+lyrics\s+(?:into|to)\s+.+?\(.+?\)",
     )
     .unwrap();
-    line_count.is_match(prompt)
-        && Regex::new(r"(?im)^INPUT:\s*$").unwrap().is_match(prompt)
-        && Regex::new(r"(?im)^OUTPUT\s*\(").unwrap().is_match(prompt)
-        && !prompt.to_ascii_lowercase().contains("pronunciation")
+    let plain_target = Regex::new(
+        r"(?im)\bTranslate\s+these\s+\d+\s+lines\s+of\s+song\s+lyrics\s+(?:into|to)\s+[^\r\n.]+\.?",
+    )
+    .unwrap();
+
+    (has_output || lower.contains("you are a lyrics translator"))
+        && (native_target.is_match(prompt) || plain_target.is_match(prompt))
 }
 
 fn looks_like_phonetic_prompt(prompt: &str) -> bool {
     let lower = prompt.to_ascii_lowercase();
+    let has_input = Regex::new(r"(?im)^INPUT:\s*$").unwrap().is_match(prompt);
+    let has_output = Regex::new(r"(?im)^OUTPUT\s*\(").unwrap().is_match(prompt);
+    if !has_input {
+        return false;
+    }
+
     if lower.contains("you are a pronunciation converter")
-        && lower.contains("this is a pronunciation task")
+        && (lower.contains("this is a pronunciation task") || has_output)
     {
         return true;
     }
@@ -277,9 +293,12 @@ fn looks_like_phonetic_prompt(prompt: &str) -> bool {
         r"(?is)\b(?:Convert|Transcribe)\s+these\s+\d+\s+lines\s+of\s+lyrics\s+to\s+pronunciation\b",
     )
     .unwrap();
-    (full.is_match(prompt) || simple.is_match(prompt))
-        && Regex::new(r"(?im)^INPUT:\s*$").unwrap().is_match(prompt)
-        && Regex::new(r"(?im)^OUTPUT\s*\(").unwrap().is_match(prompt)
+    let original_web = Regex::new(
+        r"(?is)\b(?:Convert|Transcribe)\s+these\s+\d+\s+lines\s+of\s+lyrics\s+into\s+pronunciation\s+for\s+.+?\s+speakers\b",
+    )
+    .unwrap();
+    (has_output || original_web.is_match(prompt))
+        && (full.is_match(prompt) || simple.is_match(prompt) || original_web.is_match(prompt))
 }
 
 fn extract_lyrics(prompt: &str) -> Option<String> {
@@ -298,7 +317,7 @@ fn extract_lyrics(prompt: &str) -> Option<String> {
         (Some(a), Some(b)) => a.min(b),
         (Some(a), None) => a,
         (None, Some(b)) => b,
-        (None, None) => return None,
+        (None, None) => search.len(),
     };
     Some(search[..end].trim_end_matches(['\r', '\n']).to_owned())
 }
@@ -308,7 +327,14 @@ fn extract_translation_line_count(prompt: &str) -> usize {
         prompt,
         r"(?is)\bTranslate\s+these\s+(?P<count>\d+)\s+lines\s+of\s+song\s+lyrics\s+(?:into|to)\s+.+?\(.+?\)",
     )
+    .or_else(|| {
+        capture_usize(
+            prompt,
+            r"(?is)\bTranslate\s+these\s+(?P<count>\d+)\s+lines\s+of\s+song\s+lyrics\s+(?:into|to)\s+[^\r\n.]+\.?",
+        )
+    })
     .or_else(|| capture_usize(prompt, r"(?is)\bOUTPUT\s*\(\s*(?P<count>\d+)\s+lines\s+in\s+[^)]+\)"))
+    .or_else(|| capture_usize(prompt, r"(?is)\bOUTPUT\s*\(\s*(?P<count>\d+)\s+lines\s*\)"))
     .unwrap_or(0)
 }
 
@@ -317,6 +343,12 @@ fn extract_phonetic_line_count(prompt: &str) -> usize {
         prompt,
         r"(?is)\b(?:Convert|Transcribe)\s+these\s+(?P<count>\d+)\s+lines\s+of\s+lyrics\s+into\s+how\s+they\s+SOUND\b",
     )
+    .or_else(|| {
+        capture_usize(
+            prompt,
+            r"(?is)\b(?:Convert|Transcribe)\s+these\s+(?P<count>\d+)\s+lines\s+of\s+lyrics\s+into\s+pronunciation\s+for\s+.+?\s+speakers\b",
+        )
+    })
     .or_else(|| capture_usize(prompt, r"(?is)\bOUTPUT\s*\(\s*(?P<count>\d+)\s+lines\s*\)"))
     .unwrap_or(0)
 }
@@ -335,6 +367,19 @@ fn extract_translation_target(prompt: &str) -> String {
         if !native.is_empty() {
             return native;
         }
+    }
+
+    let plain_header = Regex::new(
+        r"(?im)\bTranslate\s+these\s+\d+\s+lines\s+of\s+song\s+lyrics\s+(?:into|to)\s+(?P<target>[^\r\n.]+?)\s*(?:[.\r\n]|$)",
+    )
+    .unwrap();
+    if let Some(target) = plain_header
+        .captures(prompt)
+        .and_then(|c| c.name("target"))
+        .map(|m| clean_inline(m.as_str()))
+        .filter(|s| !s.is_empty())
+    {
+        return target;
     }
 
     let output =
@@ -711,6 +756,65 @@ OUTPUT (3 lines in Korean)";
         assert!(rewritten.prompt.contains("[1] one"));
         assert!(rewritten.prompt.contains("[2] two"));
         assert!(rewritten.prompt.contains("[3]"));
+    }
+
+    #[test]
+    fn translation_rewrite_accepts_ruster_ai_provider_prompt() {
+        let prompt = "You are a lyrics translator. Translate these 2 lines of song lyrics into Korean (한국어).\n\
+\n\
+RULES:\n\
+- Output EXACTLY 2 lines, one translation per line\n\
+- Keep empty lines as empty\n\
+- Keep symbols like [Chorus], (Yeah), and ♪ as-is\n\
+- Do NOT add numbering, quotes, notes, or explanations\n\
+- Do NOT use markdown or code blocks\n\
+- Return only the translated lines\n\
+\n\
+INPUT:\n\
+one\n\
+two";
+        let config = PromptConfig::default();
+        let rewritten = try_rewrite_translation(prompt, &config).unwrap();
+
+        assert_eq!(rewritten.line_count, 2);
+        assert!(rewritten.strip_number_tags_from_response);
+        assert!(
+            rewritten
+                .prompt
+                .contains("Target language: Korean (한국어).")
+        );
+        assert!(rewritten.prompt.contains("[1] one"));
+        assert!(rewritten.prompt.contains("[2] two"));
+        assert!(!rewritten.prompt.contains("You are a lyrics translator"));
+        assert!(
+            !rewritten
+                .prompt
+                .contains("Return only the translated lines")
+        );
+    }
+
+    #[test]
+    fn phonetic_rewrite_accepts_original_web_provider_prompt_without_output_marker() {
+        let prompt = "Convert these 2 lines of lyrics into pronunciation for Korean speakers.\n\
+\n\
+RULES:\n\
+- Output EXACTLY 2 lines, one pronunciation per line\n\
+- Keep empty lines as empty\n\
+- Keep symbols like [Chorus], (Yeah), and ♪ as-is\n\
+- Do NOT translate the meaning\n\
+- Do NOT add numbering, quotes, notes, or explanations\n\
+- Do NOT use markdown or code blocks\n\
+- Use Korean Hangul pronunciation\n\
+- Return only the pronunciation lines\n\
+\n\
+INPUT:\n\
+春\n\
+song";
+        let rewritten = try_rewrite_phonetic(prompt).unwrap();
+
+        assert_eq!(rewritten.line_count, 2);
+        assert_eq!(rewritten.source_lines, vec!["春", "song"]);
+        assert!(rewritten.strip_number_tags_from_response);
     }
 
     #[test]
