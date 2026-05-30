@@ -18,10 +18,12 @@ use crate::logging::LogBuffer;
 use crate::model_catalog;
 use crate::prompt_config::PromptConfig;
 use crate::settings::{AppSettings, generate_local_api_key, normalize_theme_mode};
+use crate::update_check::{self, UpdateInfo};
 use crate::usage_metrics::{UsageBucket, UsageMetrics, UsageSnapshot, UsageStatsPeriod};
 use crate::windows_startup;
 
 static DARK_UI: AtomicBool = AtomicBool::new(false);
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEVELOPER_NAME: &str = "hohofught";
 const DEVELOPER_GITHUB: &str = "https://github.com/hohofught";
 const DEVELOPER_TELEGRAM: &str = "@username_6974";
@@ -219,6 +221,84 @@ impl Default for CliSetupPanelState {
     }
 }
 
+#[derive(Clone, Debug)]
+struct UpdateCheckPanelState {
+    phase: String,
+    summary: String,
+    detail: String,
+    release_url: String,
+    primary_asset_name: String,
+    primary_asset_download_url: String,
+    update_available: bool,
+    finished: bool,
+}
+
+impl Default for UpdateCheckPanelState {
+    fn default() -> Self {
+        Self {
+            phase: "대기".to_owned(),
+            summary: format!("현재 버전: v{APP_VERSION}"),
+            detail: "GitHub 최신 릴리스 기준으로 확인합니다.".to_owned(),
+            release_url: String::new(),
+            primary_asset_name: String::new(),
+            primary_asset_download_url: String::new(),
+            update_available: false,
+            finished: false,
+        }
+    }
+}
+
+fn update_check_checking_state() -> UpdateCheckPanelState {
+    UpdateCheckPanelState {
+        phase: "확인 중".to_owned(),
+        summary: format!("현재 버전: v{APP_VERSION}"),
+        detail: "GitHub 최신 릴리스를 조회하고 있습니다.".to_owned(),
+        ..Default::default()
+    }
+}
+
+fn update_check_success_state(info: UpdateInfo) -> UpdateCheckPanelState {
+    let published = info
+        .published_at
+        .map(|value| value.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| "-".to_owned());
+    let summary = if info.update_available {
+        format!(
+            "새 버전이 있습니다: {} (현재 v{})",
+            info.latest_tag, info.current_version
+        )
+    } else {
+        format!(
+            "최신 버전입니다: 현재 v{} / GitHub {}",
+            info.current_version, info.latest_tag
+        )
+    };
+
+    UpdateCheckPanelState {
+        phase: "확인 완료".to_owned(),
+        summary,
+        detail: format!(
+            "GitHub 최신 버전: {}\n릴리스 날짜: {published}",
+            info.latest_version
+        ),
+        release_url: info.release_url,
+        primary_asset_name: info.primary_asset_name.unwrap_or_default(),
+        primary_asset_download_url: info.primary_asset_download_url.unwrap_or_default(),
+        update_available: info.update_available,
+        finished: true,
+    }
+}
+
+fn update_check_error_state(error: String) -> UpdateCheckPanelState {
+    UpdateCheckPanelState {
+        phase: "확인 실패".to_owned(),
+        summary: "GitHub 최신 릴리스를 확인하지 못했습니다.".to_owned(),
+        detail: error,
+        finished: true,
+        ..Default::default()
+    }
+}
+
 struct RusterApp {
     paths: AppPaths,
     settings: Arc<RwLock<AppSettings>>,
@@ -237,6 +317,10 @@ struct RusterApp {
     last_cli_setup_phase: String,
     cli_model_verified_notice: Option<String>,
     cli_start_after_setup: bool,
+    update_check_inflight: Arc<AtomicBool>,
+    update_check_panel: Arc<RwLock<UpdateCheckPanelState>>,
+    last_update_check_marker: String,
+    show_update_check_dialog: bool,
     prompt_editor_text: String,
     confirm_usage_reset: bool,
     show_developer_info: bool,
@@ -292,6 +376,10 @@ impl RusterApp {
             last_cli_setup_phase: String::new(),
             cli_model_verified_notice: None,
             cli_start_after_setup: false,
+            update_check_inflight: Arc::new(AtomicBool::new(false)),
+            update_check_panel: Arc::new(RwLock::new(UpdateCheckPanelState::default())),
+            last_update_check_marker: String::new(),
+            show_update_check_dialog: false,
             prompt_editor_text,
             confirm_usage_reset: false,
             show_developer_info: false,
@@ -381,6 +469,54 @@ impl RusterApp {
         state.phase = phase.into();
         state.summary = summary.into();
         state.detail = detail.into();
+    }
+
+    fn set_update_check_panel(
+        panel: &Arc<RwLock<UpdateCheckPanelState>>,
+        state: UpdateCheckPanelState,
+    ) {
+        *panel.write() = state;
+    }
+
+    fn sync_update_check_status(&mut self) {
+        let state = self.update_check_panel.read().clone();
+        let marker = format!("{}|{}", state.phase, state.summary);
+        if marker == self.last_update_check_marker {
+            return;
+        }
+
+        if state.finished {
+            self.logs.push(format!(
+                "[Update] {} {}",
+                state.phase,
+                crate::logging::summarize_text(&state.summary, 180)
+            ));
+            self.set_status(state.summary.clone());
+        }
+        self.last_update_check_marker = marker;
+    }
+
+    fn launch_update_check(&mut self) {
+        self.show_update_check_dialog = true;
+        if self.update_check_inflight.swap(true, Ordering::SeqCst) {
+            self.set_status("업데이트 확인이 이미 진행 중입니다.");
+            return;
+        }
+
+        let panel = self.update_check_panel.clone();
+        let inflight = self.update_check_inflight.clone();
+        let logs = self.logs.clone();
+        Self::set_update_check_panel(&panel, update_check_checking_state());
+        self.set_status("GitHub 최신 릴리스를 확인 중입니다.");
+        logs.push("[Update] GitHub 최신 릴리스 확인 시작");
+        self.runtime.spawn(async move {
+            let state = match update_check::check_latest_release(APP_VERSION).await {
+                Ok(info) => update_check_success_state(info),
+                Err(error) => update_check_error_state(error.to_string()),
+            };
+            Self::set_update_check_panel(&panel, state);
+            inflight.store(false, Ordering::SeqCst);
+        });
     }
 
     fn refresh_cli_setup_environment(&mut self) {
@@ -762,9 +898,25 @@ impl RusterApp {
                 ui.set_width(ui.available_width());
                 ui.label(RichText::new(&self.status_message).color(muted_text()));
                 ui.add_space(8.0);
-                if ui.button("개발자 정보").clicked() {
-                    self.show_developer_info = true;
-                }
+                ui.horizontal_wrapped(|ui| {
+                    let checking = self.update_check_inflight.load(Ordering::SeqCst);
+                    if ui
+                        .add_enabled(
+                            !checking,
+                            egui::Button::new(if checking {
+                                "확인 중..."
+                            } else {
+                                "업데이트 확인"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.launch_update_check();
+                    }
+                    if ui.button("개발자 정보").clicked() {
+                        self.show_developer_info = true;
+                    }
+                });
             });
         });
     }
@@ -1348,6 +1500,85 @@ impl RusterApp {
         }
     }
 
+    fn draw_update_check_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_update_check_dialog {
+            return;
+        }
+
+        let state = self.update_check_panel.read().clone();
+        let checking = self.update_check_inflight.load(Ordering::SeqCst);
+        let mut close = false;
+        let mut retry = false;
+        egui::Window::new("업데이트 확인")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                let phase_color = if state.update_available {
+                    warning()
+                } else if state.finished {
+                    success()
+                } else {
+                    accent_light()
+                };
+                ui.label(
+                    RichText::new(&state.phase)
+                        .size(18.0)
+                        .strong()
+                        .color(phase_color),
+                );
+                ui.add_space(8.0);
+                ui.add(egui::Label::new(RichText::new(&state.summary).color(text())).wrap());
+                if !state.detail.trim().is_empty() {
+                    ui.add_space(8.0);
+                    draw_multiline_scroll_text(ui, "update_check_detail", &state.detail);
+                }
+                if !state.release_url.trim().is_empty() {
+                    ui.add_space(8.0);
+                    ui.hyperlink_to("GitHub 릴리스 열기", &state.release_url);
+                }
+                if !state.primary_asset_download_url.trim().is_empty() {
+                    ui.hyperlink_to(
+                        format!("다운로드: {}", state.primary_asset_name),
+                        &state.primary_asset_download_url,
+                    );
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !checking,
+                            egui::Button::new(if checking {
+                                "확인 중..."
+                            } else {
+                                "다시 확인"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        retry = true;
+                    }
+                    if !state.release_url.trim().is_empty()
+                        && ui.button("릴리스 링크 복사").clicked()
+                    {
+                        ui.ctx().copy_text(state.release_url.clone());
+                        self.set_status("GitHub 릴리스 링크를 복사했습니다.");
+                    }
+                    if ui.button("닫기").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if retry {
+            self.launch_update_check();
+        }
+        if close {
+            self.show_update_check_dialog = false;
+        }
+    }
+
     fn draw_developer_info_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_developer_info {
             return;
@@ -1362,6 +1593,7 @@ impl RusterApp {
                 ui.set_min_width(360.0);
                 ui.label(RichText::new("ruster").size(20.0).strong().color(text()));
                 ui.add_space(8.0);
+                ui.label(RichText::new(format!("버전: v{APP_VERSION}")).color(text()));
                 ui.label(RichText::new(format!("개발자: {DEVELOPER_NAME}")).color(text()));
                 ui.hyperlink_to(DEVELOPER_GITHUB, DEVELOPER_GITHUB);
                 ui.hyperlink_to(
@@ -1806,6 +2038,7 @@ impl eframe::App for RusterApp {
         self.apply_gui_theme(ctx);
         self.sync_cli_cache_from_settings();
         self.sync_cli_setup_notice();
+        self.sync_update_check_status();
         self.finish_cli_auto_start_after_setup();
 
         if ctx.input(|input| input.key_pressed(egui::Key::F12)) {
@@ -1850,6 +2083,7 @@ impl eframe::App for RusterApp {
 
         self.draw_usage_reset_dialog(ctx);
         self.draw_cli_model_verified_dialog(ctx);
+        self.draw_update_check_dialog(ctx);
         self.draw_developer_info_dialog(ctx);
 
         if self.close_requested {

@@ -22,6 +22,7 @@ mod proxy_dedup;
 mod request_guard;
 mod settings;
 mod tray;
+mod update_check;
 mod usage_metrics;
 mod web_backend;
 mod webview2_native;
