@@ -28,20 +28,27 @@ use windows::Win32::System::LibraryLoader;
 use windows::Win32::System::Threading;
 use windows::Win32::UI::HiDpi::{PROCESS_PER_MONITOR_DPI_AWARE, SetProcessDpiAwareness};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GWL_EXSTYLE, GWLP_USERDATA, GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect,
-    LWA_ALPHA, MSG, PostQuitMessage, PostThreadMessageW, RegisterClassW, SC_MINIMIZE, SC_RESTORE,
-    SET_WINDOW_POS_FLAGS, SW_RESTORE, SW_SHOWNA, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetLayeredWindowAttributes,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WA_INACTIVE, WINDOW_EX_STYLE,
-    WM_ACTIVATE, WM_APP, WM_CLOSE, WM_DESTROY, WM_NCCREATE, WM_NCDESTROY, WM_SIZE, WM_SYSCOMMAND,
-    WNDCLASSW, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW,
+    AdjustWindowRectEx, CREATESTRUCTW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
+    DestroyWindow, DispatchMessageW, GWL_EXSTYLE, GWLP_USERDATA, GetClientRect, GetMessageW,
+    GetWindowLongPtrW, GetWindowRect, LWA_ALPHA, MSG, PostQuitMessage, PostThreadMessageW,
+    RegisterClassW, SC_MINIMIZE, SC_RESTORE, SET_WINDOW_POS_FLAGS, SW_RESTORE, SW_SHOWNA,
+    SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SetForegroundWindow, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateMessage, WA_INACTIVE, WINDOW_EX_STYLE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_DESTROY,
+    WM_NCCREATE, WM_NCDESTROY, WM_SIZE, WM_SYSCOMMAND, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_LAYERED,
+    WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{Error as WindowsError, HSTRING, Interface, PCWSTR, w};
 
 use crate::logging::LogBuffer;
 
 type NativeResult<T> = Result<T, String>;
+const WEBVIEW_CLIENT_WIDTH: i32 = 1200;
+const WEBVIEW_CLIENT_HEIGHT: i32 = 800;
+const WEBVIEW_MIN_CLIENT_WIDTH: i32 = 800;
+const WEBVIEW_MIN_CLIENT_HEIGHT: i32 = 600;
+const WEBVIEW_DEFAULT_LEFT: i32 = 80;
+const WEBVIEW_DEFAULT_TOP: i32 = 80;
 
 pub struct NativeWebView2Session {
     tx: mpsc::Sender<NativeCommand>,
@@ -776,6 +783,7 @@ fn create_frame_window(title: &str) -> NativeResult<HWND> {
         let _ = RegisterClassW(&class);
     }
 
+    let initial_size = window_size_for_client_size(WEBVIEW_CLIENT_WIDTH, WEBVIEW_CLIENT_HEIGHT);
     let title = HSTRING::from(title);
     let hwnd = unsafe {
         CreateWindowExW(
@@ -785,8 +793,8 @@ fn create_frame_window(title: &str) -> NativeResult<HWND> {
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            1120,
-            860,
+            initial_size.0,
+            initial_size.1,
             None,
             None,
             Some(hinstance),
@@ -902,23 +910,21 @@ fn visible_restore_rect(hwnd: HWND) -> RECT {
     {
         return rect;
     }
-    RECT {
-        left: 80,
-        top: 80,
-        right: 1200,
-        bottom: 940,
-    }
+    window_rect_for_client_size(
+        WEBVIEW_DEFAULT_LEFT,
+        WEBVIEW_DEFAULT_TOP,
+        WEBVIEW_CLIENT_WIDTH,
+        WEBVIEW_CLIENT_HEIGHT,
+    )
 }
 
 fn move_window_offscreen(hwnd: HWND, _keep_taskbar: bool) {
-    let rect = current_window_rect(hwnd).unwrap_or(RECT {
-        left: 0,
-        top: 0,
-        right: 1120,
-        bottom: 860,
+    let rect = current_window_rect(hwnd).unwrap_or_else(|| {
+        window_rect_for_client_size(0, 0, WEBVIEW_CLIENT_WIDTH, WEBVIEW_CLIENT_HEIGHT)
     });
-    let width = (rect.right - rect.left).max(800);
-    let height = (rect.bottom - rect.top).max(600);
+    let min_size = window_size_for_client_size(WEBVIEW_MIN_CLIENT_WIDTH, WEBVIEW_MIN_CLIENT_HEIGHT);
+    let width = (rect.right - rect.left).max(min_size.0);
+    let height = (rect.bottom - rect.top).max(min_size.1);
     let flags = SET_WINDOW_POS_FLAGS(SWP_NOZORDER.0 | SWP_NOACTIVATE.0);
     unsafe {
         let _ = SetWindowPos(hwnd, None, -10000, -10000, width, height, flags);
@@ -933,10 +939,42 @@ fn current_window_rect(hwnd: HWND) -> Option<RECT> {
 }
 
 fn set_window_rect(hwnd: HWND, rect: RECT, flags: SET_WINDOW_POS_FLAGS) {
-    let width = (rect.right - rect.left).max(800);
-    let height = (rect.bottom - rect.top).max(600);
+    let min_size = window_size_for_client_size(WEBVIEW_MIN_CLIENT_WIDTH, WEBVIEW_MIN_CLIENT_HEIGHT);
+    let width = (rect.right - rect.left).max(min_size.0);
+    let height = (rect.bottom - rect.top).max(min_size.1);
     unsafe {
         let _ = SetWindowPos(hwnd, None, rect.left, rect.top, width, height, flags);
+    }
+}
+
+fn window_size_for_client_size(client_width: i32, client_height: i32) -> (i32, i32) {
+    let rect = window_rect_for_client_size(0, 0, client_width, client_height);
+    (rect.right - rect.left, rect.bottom - rect.top)
+}
+
+fn window_rect_for_client_size(left: i32, top: i32, client_width: i32, client_height: i32) -> RECT {
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: client_width.max(1),
+        bottom: client_height.max(1),
+    };
+    unsafe {
+        let _ = AdjustWindowRectEx(
+            &mut rect,
+            WS_OVERLAPPEDWINDOW,
+            false,
+            WINDOW_EX_STYLE::default(),
+        );
+    }
+
+    let width = (rect.right - rect.left).max(client_width);
+    let height = (rect.bottom - rect.top).max(client_height);
+    RECT {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
     }
 }
 

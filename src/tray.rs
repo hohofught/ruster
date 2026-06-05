@@ -300,6 +300,7 @@ mod platform {
         theme: TrayTheme,
         fonts: UiFonts,
         buttons: Vec<HWND>,
+        close_requested: bool,
     }
 
     #[derive(Clone, Debug)]
@@ -721,9 +722,7 @@ mod platform {
             }
             WM_ACTIVATE => {
                 if (w_param.0 & 0xffff) as u32 == WA_INACTIVE {
-                    unsafe {
-                        let _ = DestroyWindow(hwnd);
-                    }
+                    close_tray_menu_window_once(hwnd);
                     return LRESULT(0);
                 }
             }
@@ -731,17 +730,14 @@ mod platform {
                 if let Some(state) = tray_menu_window_state_mut(hwnd) {
                     let command = (w_param.0 & 0xffff) as u16;
                     let owner = state.owner;
-                    unsafe {
-                        let _ = DestroyWindow(hwnd);
+                    if close_tray_menu_window_once(hwnd) {
+                        handle_command(owner, command);
                     }
-                    handle_command(owner, command);
                     return LRESULT(0);
                 }
             }
             WM_CLOSE => {
-                unsafe {
-                    let _ = DestroyWindow(hwnd);
-                }
+                close_tray_menu_window_once(hwnd);
                 return LRESULT(0);
             }
             WM_NCDESTROY => {
@@ -918,6 +914,21 @@ mod platform {
         } else {
             unsafe { ptr.as_mut() }
         }
+    }
+
+    fn close_tray_menu_window_once(hwnd: HWND) -> bool {
+        let Some(state) = tray_menu_window_state_mut(hwnd) else {
+            return false;
+        };
+        if state.close_requested {
+            return false;
+        }
+
+        state.close_requested = true;
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        true
     }
 
     fn tray_menu_window_state_mut(hwnd: HWND) -> Option<&'static mut TrayMenuWindowState> {
@@ -1132,6 +1143,7 @@ mod platform {
             theme: current_theme(tray_state),
             fonts: UiFonts::new(),
             buttons: Vec::new(),
+            close_requested: false,
         });
         let state_ptr = Box::into_raw(state);
         let create_result = unsafe {

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,6 +13,7 @@ use axum::routing::any;
 use parking_lot::RwLock;
 use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, oneshot};
 
 use crate::app_paths::AppPaths;
@@ -34,6 +36,8 @@ const RUSTER_MODEL_OWNER: &str = "ruster";
 const RUSTER_OPENAI_ERROR_TYPE: &str = "ruster_error";
 const RUSTER_GEMINI_MODEL_DESCRIPTION: &str = "ruster local Gemini bridge model";
 const CUSTOM_API_PROVIDER: &str = "CustomApi";
+const LISTENER_RETRY_DELAY: Duration = Duration::from_secs(3);
+const LISTENER_MAX_RETRIES: usize = 5;
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -53,7 +57,7 @@ pub async fn serve(
     settings: Arc<RwLock<AppSettings>>,
     host: Arc<TranslatorHost>,
     logs: LogBuffer,
-    shutdown: oneshot::Receiver<()>,
+    mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
     let prompt_config = PromptConfig::load(&paths, &logs);
     let usage = UsageMetrics::new(&paths, logs.clone());
@@ -76,7 +80,7 @@ pub async fn serve(
     };
     let ip = resolve_bind_ip(&host_name);
     let addr = SocketAddr::new(ip, port);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = bind_listener_with_retry(addr, &host_name, &logs, &mut shutdown).await?;
     let local_addr = listener.local_addr()?;
     logs.push(format!(
         "[HTTP] ruster listening on http://{}:{}/",
@@ -179,6 +183,88 @@ fn resolve_bind_ip(host: &str) -> IpAddr {
     } else {
         host.parse().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
     }
+}
+
+async fn bind_listener_with_retry(
+    addr: SocketAddr,
+    configured_host: &str,
+    logs: &LogBuffer,
+    shutdown: &mut oneshot::Receiver<()>,
+) -> Result<TcpListener> {
+    let max_attempts = LISTENER_MAX_RETRIES + 1;
+    let mut last_error = None;
+
+    for attempt in 1..=max_attempts {
+        match TcpListener::bind(addr).await {
+            Ok(listener) => {
+                if attempt > 1 {
+                    logs.push(format!(
+                        "[HTTP] 리스너 시작 성공 (재시도 {}/{})",
+                        attempt - 1,
+                        LISTENER_MAX_RETRIES
+                    ));
+                }
+                return Ok(listener);
+            }
+            Err(error) => {
+                log_listener_bind_error(configured_host, addr.port(), &error, logs);
+                last_error = Some(error);
+            }
+        }
+
+        if attempt > LISTENER_MAX_RETRIES {
+            break;
+        }
+
+        logs.push(format!(
+            "[HTTP] {}초 후 자동 재시도합니다. ({}/{})",
+            LISTENER_RETRY_DELAY.as_secs(),
+            attempt,
+            LISTENER_MAX_RETRIES
+        ));
+        tokio::select! {
+            _ = tokio::time::sleep(LISTENER_RETRY_DELAY) => {}
+            _ = &mut *shutdown => {
+                anyhow::bail!("[HTTP] 리스너 시작 대기 중 종료 신호를 받아 중단합니다.");
+            }
+        }
+    }
+
+    let message = format!(
+        "http://{}:{}/ 리스너 시작 실패 (자동 재시도 {}회 소진)",
+        configured_host,
+        addr.port(),
+        LISTENER_MAX_RETRIES
+    );
+    match last_error {
+        Some(error) => Err(anyhow::anyhow!("{message}: {error}")),
+        None => Err(anyhow::anyhow!(message)),
+    }
+}
+
+fn log_listener_bind_error(configured_host: &str, port: u16, error: &io::Error, logs: &LogBuffer) {
+    if error.kind() == io::ErrorKind::AddrInUse {
+        logs.push(format!(
+            "[HTTP] 포트 충돌: http://{}:{}/ 가 이미 사용 중입니다.",
+            configured_host, port
+        ));
+        return;
+    }
+
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        logs.push(format!(
+            "[HTTP] 액세스 거부: http://{}:{}/ 바인드 권한이 없습니다.",
+            configured_host, port
+        ));
+        return;
+    }
+
+    logs.push(format!(
+        "[HTTP] 리스너 시작 실패: {} (kind={:?}, raw_os_error={:?})",
+        error,
+        error.kind(),
+        error.raw_os_error()
+    ));
 }
 
 fn parse_query(query: &str) -> HashMap<String, Vec<String>> {
