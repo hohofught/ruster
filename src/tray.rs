@@ -72,9 +72,10 @@ fn build_dashboard_text(
     };
 
     format!(
-        "Mode: {}\nBase URL: {}\nRaw Prompt: {}\nWebView visibility: {}\nStatus: 실행 중\n\nRequests: {} total / {} ok / {} failed / {} cancelled\nSuccess rate: {:.1}%\nStarted: {}\nLast updated: {}\nLast failure: {}",
+        "Mode: {}\nBase URL: {}\nMORT CLI Raw: {}\nRaw Prompt: {}\nWebView visibility: {}\nStatus: 실행 중\n\nRequests: {} total / {} ok / {} failed / {} cancelled\nSuccess rate: {:.1}%\nStarted: {}\nLast updated: {}\nLast failure: {}",
         mode.label(),
         settings.base_url,
+        on_off(settings.mort_cli_raw_mode),
         on_off(settings.raw_prompt_mode),
         webview_status,
         usage.total_requests,
@@ -307,6 +308,7 @@ mod platform {
     struct DashboardData {
         mode_label: String,
         base_url: String,
+        mort_cli_raw: String,
         raw_prompt: String,
         webview_status: String,
         runtime_status: String,
@@ -1215,7 +1217,7 @@ mod platform {
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 620,
-                430,
+                452,
                 Some(owner),
                 None,
                 Some(hinstance),
@@ -1371,6 +1373,7 @@ mod platform {
         DashboardData {
             mode_label: mode.label().to_owned(),
             base_url: settings.base_url,
+            mort_cli_raw: on_off(settings.mort_cli_raw_mode).to_owned(),
             raw_prompt: on_off(settings.raw_prompt_mode).to_owned(),
             webview_status: webview_status.to_owned(),
             runtime_status,
@@ -1887,7 +1890,7 @@ mod platform {
             left: 18,
             top: 96,
             right: width - 18,
-            bottom: 204,
+            bottom: 226,
         };
         draw_round_rect(hdc, info, theme.surface, theme.border, 12);
         draw_info_line(
@@ -1907,8 +1910,8 @@ mod platform {
             hdc,
             theme,
             &state.fonts,
-            "Raw Prompt",
-            &state.data.raw_prompt,
+            "MORT CLI Raw",
+            &state.data.mort_cli_raw,
             RECT {
                 left: 36,
                 top: 134,
@@ -1920,8 +1923,8 @@ mod platform {
             hdc,
             theme,
             &state.fonts,
-            "WebView",
-            &state.data.webview_status,
+            "Raw Prompt",
+            &state.data.raw_prompt,
             RECT {
                 left: 36,
                 top: 156,
@@ -1933,8 +1936,8 @@ mod platform {
             hdc,
             theme,
             &state.fonts,
-            "상태",
-            &state.data.runtime_status,
+            "WebView",
+            &state.data.webview_status,
             RECT {
                 left: 36,
                 top: 178,
@@ -1942,8 +1945,21 @@ mod platform {
                 bottom: 198,
             },
         );
+        draw_info_line(
+            hdc,
+            theme,
+            &state.fonts,
+            "상태",
+            &state.data.runtime_status,
+            RECT {
+                left: 36,
+                top: 200,
+                right: width - 36,
+                bottom: 220,
+            },
+        );
 
-        let metric_top = 220;
+        let metric_top = 242;
         let metric_width = ((width - 36) - card_gap * 3) / 4;
         for (index, (label, value, emphasis)) in [
             ("총 요청", state.data.total_requests.as_str(), false),
@@ -1976,9 +1992,9 @@ mod platform {
             &state.data.provider_summary,
             RECT {
                 left: 20,
-                top: 296,
+                top: 318,
                 right: width - 20,
-                bottom: 316,
+                bottom: 338,
             },
             theme.muted,
             &state.fonts.small,
@@ -1992,9 +2008,9 @@ mod platform {
             ),
             RECT {
                 left: 20,
-                top: 316,
+                top: 338,
                 right: width - 20,
-                bottom: 336,
+                bottom: 358,
             },
             theme.muted_soft,
             &state.fonts.small,
@@ -2005,9 +2021,9 @@ mod platform {
             &state.notice,
             RECT {
                 left: 20,
-                top: 336,
+                top: 358,
                 right: width - 20,
-                bottom: 356,
+                bottom: 378,
             },
             theme.muted,
             &state.fonts.small,
@@ -2623,6 +2639,7 @@ mod tests {
 
         assert!(text.contains("Mode:"));
         assert!(text.contains("Base URL: http://localhost:5000"));
+        assert!(text.contains("MORT CLI Raw: On"));
         assert!(text.contains("Raw Prompt: On"));
         assert!(text.contains("WebView visibility:"));
         assert!(text.contains("Status: 실행 중"));

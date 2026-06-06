@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::app_paths::AppPaths;
 use crate::logging::LogBuffer;
@@ -155,21 +157,25 @@ pub fn build_prompt(
     preset: Option<&CustomApiPreset>,
     source_code: &str,
     result_code: &str,
+    build_default_translation_prompt: bool,
 ) -> String {
     let Some(preset) = preset else {
+        if build_default_translation_prompt {
+            return build_default_mort_translation_prompt(original_text, source_code, result_code);
+        }
         return original_text.to_owned();
     };
     if preset.request_template.trim().is_empty() {
         return original_text.to_owned();
     }
 
-    replace_plain_tokens(
+    let rendered = render_request_template(
         &preset.request_template,
         original_text,
-        "",
         source_code,
         result_code,
-    )
+    );
+    try_extract_prompt_from_rendered_request(&rendered).unwrap_or(rendered)
 }
 
 pub fn build_mort_json_response(result: &str, error_message: &str, error_code: &str) -> String {
@@ -195,13 +201,14 @@ pub fn build_custom_json_response(
         return build_mort_json_response(result, "", "0");
     }
 
-    let mut template = preset.response_template.trim().to_owned();
-    if !template.starts_with('{') && !template.starts_with('[') {
-        template = format!("{{{template}}}");
-    }
-    let rendered =
-        replace_json_value_tokens(&template, original_text, result, source_code, result_code);
-    if serde_json::from_str::<serde_json::Value>(&rendered).is_ok() {
+    let rendered = render_response_template(
+        &preset.response_template,
+        original_text,
+        result,
+        source_code,
+        result_code,
+    );
+    if serde_json::from_str::<Value>(&rendered).is_ok() {
         rendered
     } else {
         build_mort_json_response(result, "", "0")
@@ -244,27 +251,62 @@ pub fn extract_incoming_text(body: &str) -> IncomingText {
     }
 }
 
-fn replace_plain_tokens(
+fn render_request_template(
+    template: &str,
+    ocr_text: &str,
+    source_code: &str,
+    result_code: &str,
+) -> String {
+    if !looks_like_structured_template(template) {
+        return replace_plain_tokens(template, ocr_text, "", source_code, result_code, ocr_text);
+    }
+
+    let rendered =
+        replace_json_template_tokens(template, ocr_text, "", source_code, result_code, ocr_text);
+    normalize_object_template_to_json(&rendered)
+}
+
+fn render_response_template(
     template: &str,
     ocr_text: &str,
     result_text: &str,
     source_code: &str,
     result_code: &str,
 ) -> String {
-    template
-        .replace("{OCR_TEXT}", ocr_text)
-        .replace("{RESULT_TEXT}", result_text)
-        .replace("{SOURCE_CODE}", source_code)
-        .replace("{RESULT_CODE}", result_code)
-        .replace("{RAW_PROMPT}", ocr_text)
+    let rendered = replace_json_template_tokens(
+        template,
+        ocr_text,
+        result_text,
+        source_code,
+        result_code,
+        ocr_text,
+    );
+    normalize_object_template_to_json(&rendered)
 }
 
-fn replace_json_value_tokens(
+fn replace_plain_tokens(
     template: &str,
     ocr_text: &str,
     result_text: &str,
     source_code: &str,
     result_code: &str,
+    raw_prompt: &str,
+) -> String {
+    template
+        .replace("{OCR_TEXT}", ocr_text)
+        .replace("{RESULT_TEXT}", result_text)
+        .replace("{SOURCE_CODE}", source_code)
+        .replace("{RESULT_CODE}", result_code)
+        .replace("{RAW_PROMPT}", raw_prompt)
+}
+
+fn replace_json_template_tokens(
+    template: &str,
+    ocr_text: &str,
+    result_text: &str,
+    source_code: &str,
+    result_code: &str,
+    raw_prompt: &str,
 ) -> String {
     let mut out = template.to_owned();
     for (token, value) in [
@@ -272,18 +314,280 @@ fn replace_json_value_tokens(
         ("{RESULT_TEXT}", result_text),
         ("{SOURCE_CODE}", source_code),
         ("{RESULT_CODE}", result_code),
-        ("{RAW_PROMPT}", ocr_text),
+        ("{RAW_PROMPT}", raw_prompt),
     ] {
-        let json = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned());
-        out = out.replace(&format!("\"{token}\""), &json);
-        out = out.replace(token, &json);
+        out = replace_json_template_token(&out, token, value);
     }
     out
 }
 
+fn replace_json_template_token(template: &str, token: &str, value: &str) -> String {
+    if template.is_empty() || !template.contains(token) {
+        return template.to_owned();
+    }
+
+    let mut out = String::with_capacity(template.len() + value.len().min(256));
+    let mut search_start = 0;
+    while let Some(offset) = template[search_start..].find(token) {
+        let index = search_start + offset;
+        out.push_str(&template[search_start..index]);
+        if is_inside_quoted_string(template, index) {
+            out.push_str(&escape_json_string_content(value));
+        } else {
+            out.push_str(&serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned()));
+        }
+        search_start = index + token.len();
+    }
+    out.push_str(&template[search_start..]);
+    out
+}
+
+fn escape_json_string_content(value: &str) -> String {
+    let json = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned());
+    json.strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn is_inside_quoted_string(value: &str, token_index: usize) -> bool {
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in value[..token_index].chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            _ => {}
+        }
+    }
+    in_string
+}
+
+fn looks_like_structured_template(template: &str) -> bool {
+    let trimmed = template.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return true;
+    }
+
+    Regex::new(r#"(?s)^\s*"?[A-Za-z0-9_ .-]+"?\s*[:=]"#)
+        .ok()
+        .is_some_and(|re| re.is_match(template))
+}
+
+fn normalize_object_template_to_json(template: &str) -> String {
+    let mut content = template.trim().to_owned();
+    if content.is_empty() {
+        return "{}".to_owned();
+    }
+
+    if (content.starts_with('{') || content.starts_with('[')) && parse_json_value(&content).is_ok()
+    {
+        return content;
+    }
+
+    if !content.starts_with('{') && !content.starts_with('[') {
+        content = format!("{{{content}}}");
+        if parse_json_value(&content).is_ok() {
+            return content;
+        }
+    }
+
+    if content.starts_with('[') {
+        return content;
+    }
+
+    let inner = content
+        .strip_prefix('{')
+        .and_then(|v| v.strip_suffix('}'))
+        .unwrap_or(&content);
+    let parts = split_top_level(inner, ',');
+    let mut json_parts = Vec::new();
+    for property in parts {
+        if let Some((key, value)) = parse_template_property(&property) {
+            if !key.trim().is_empty() {
+                let key_json =
+                    serde_json::to_string(key.trim()).unwrap_or_else(|_| "\"\"".to_owned());
+                json_parts.push(format!("{key_json}: {value}"));
+            }
+        }
+    }
+
+    format!("{{{}}}", json_parts.join(", "))
+}
+
+fn parse_template_property(property: &str) -> Option<(String, String)> {
+    let property = property.trim();
+    if property.is_empty() {
+        return None;
+    }
+
+    for separator in [':', '='] {
+        if let Some(index) = find_top_level_separator(property, separator) {
+            let key = property[..index].trim().trim_matches('"').to_owned();
+            let value = normalize_template_value(property[index + 1..].trim());
+            return Some((key, value));
+        }
+    }
+
+    None
+}
+
+fn normalize_template_value(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return "\"\"".to_owned();
+    }
+    if parse_json_value(value).is_ok() {
+        return value.to_owned();
+    }
+    if value.starts_with('[') && value.ends_with(']') {
+        let inner = &value[1..value.len() - 1];
+        let values = split_top_level(inner, ',')
+            .into_iter()
+            .map(|value| normalize_template_value(&value))
+            .collect::<Vec<_>>();
+        return format!("[{}]", values.join(", "));
+    }
+    if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false") {
+        return value.to_ascii_lowercase();
+    }
+    if value.eq_ignore_ascii_case("null") {
+        return "null".to_owned();
+    }
+    if value.parse::<f64>().is_ok() {
+        return value.to_owned();
+    }
+
+    serde_json::to_string(value.trim_matches('"')).unwrap_or_else(|_| "\"\"".to_owned())
+}
+
+fn parse_json_value(value: &str) -> serde_json::Result<Value> {
+    serde_json::from_str::<Value>(value)
+}
+
+fn find_top_level_separator(value: &str, separator: char) -> Option<usize> {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut depth = 0i32;
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        match ch {
+            '[' | '{' => depth += 1,
+            ']' | '}' => depth -= 1,
+            _ if ch == separator && depth == 0 => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level(value: &str, separator: char) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut depth = 0i32;
+
+    for ch in value.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && in_string {
+            current.push(ch);
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            current.push(ch);
+            in_string = !in_string;
+            continue;
+        }
+        if !in_string {
+            match ch {
+                '[' | '{' => depth += 1,
+                ']' | '}' => depth -= 1,
+                _ if ch == separator && depth == 0 => {
+                    if !current.trim().is_empty() {
+                        out.push(current.trim().to_owned());
+                    }
+                    current.clear();
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        current.push(ch);
+    }
+
+    if !current.trim().is_empty() {
+        out.push(current.trim().to_owned());
+    }
+    out
+}
+
+fn try_extract_prompt_from_rendered_request(rendered: &str) -> Option<String> {
+    let root = serde_json::from_str::<Value>(rendered).ok()?;
+    first_string(&root, &["text", "prompt", "q", "input"])
+        .or_else(|| extract_openai_prompt(&root))
+        .or_else(|| extract_gemini_prompt(&root))
+}
+
+fn build_default_mort_translation_prompt(
+    original_text: &str,
+    source_code: &str,
+    result_code: &str,
+) -> String {
+    let source = normalize_language_label(source_code, "auto-detected language");
+    let target = normalize_language_label(result_code, "Korean");
+    format!(
+        "You are a translation engine for OCR/game text. Translate from {source} to {target}.\n\
+Return only the translated text. Preserve line breaks and do not add explanations.\n\n\
+TEXT:\n{original_text}"
+    )
+}
+
+fn normalize_language_label(value: &str, fallback: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return fallback.to_owned();
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "ko" | "kor" | "kr" | "ko-kr" => "Korean".to_owned(),
+        "ja" | "jp" | "jpn" | "ja-jp" => "Japanese".to_owned(),
+        "en" | "eng" | "en-us" | "en-gb" => "English".to_owned(),
+        "zh" | "zho" | "zh-cn" | "cn" => "Chinese".to_owned(),
+        "zh-tw" | "tw" => "Traditional Chinese".to_owned(),
+        "fr" | "fra" => "French".to_owned(),
+        "de" | "deu" => "German".to_owned(),
+        "es" | "spa" => "Spanish".to_owned(),
+        "ru" | "rus" => "Russian".to_owned(),
+        _ => trimmed.to_owned(),
+    }
+}
+
 fn first_string(root: &serde_json::Value, names: &[&str]) -> Option<String> {
     for name in names {
-        if let Some(value) = root.get(*name) {
+        if let Some(value) = get_property_ignore_case(root, name) {
             if let Some(text) = value.as_str() {
                 return Some(text.to_owned());
             }
@@ -295,18 +599,28 @@ fn first_string(root: &serde_json::Value, names: &[&str]) -> Option<String> {
     None
 }
 
+fn get_property_ignore_case<'a>(root: &'a Value, name: &str) -> Option<&'a Value> {
+    let Value::Object(obj) = root else {
+        return None;
+    };
+    obj.iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value)
+}
+
 pub fn extract_openai_prompt(root: &serde_json::Value) -> Option<String> {
-    let messages = root.get("messages")?.as_array()?;
+    let messages = get_property_ignore_case(root, "messages")?.as_array()?;
     for message in messages.iter().rev() {
         if message
-            .get("role")
+            .as_object()
+            .and_then(|_| get_property_ignore_case(message, "role"))
             .and_then(|v| v.as_str())
             .map(|role| !role.eq_ignore_ascii_case("user"))
             .unwrap_or(false)
         {
             continue;
         }
-        if let Some(text) = extract_content_text(message.get("content")?)
+        if let Some(text) = extract_content_text(get_property_ignore_case(message, "content")?)
             && !text.trim().is_empty()
         {
             return Some(text);
@@ -316,9 +630,10 @@ pub fn extract_openai_prompt(root: &serde_json::Value) -> Option<String> {
 }
 
 pub fn extract_gemini_prompt(root: &serde_json::Value) -> Option<String> {
-    let contents = root.get("contents")?.as_array()?;
+    let contents = get_property_ignore_case(root, "contents")?.as_array()?;
     for content in contents.iter().rev() {
-        let Some(parts) = content.get("parts").and_then(|v| v.as_array()) else {
+        let Some(parts) = get_property_ignore_case(content, "parts").and_then(|v| v.as_array())
+        else {
             continue;
         };
         let text = parts
@@ -336,8 +651,7 @@ pub fn extract_gemini_prompt(root: &serde_json::Value) -> Option<String> {
 pub fn extract_content_text(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(text) => Some(text.clone()),
-        serde_json::Value::Object(obj) => obj
-            .get("text")
+        serde_json::Value::Object(_) => get_property_ignore_case(value, "text")
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned),
         serde_json::Value::Array(items) => Some(
@@ -386,9 +700,43 @@ mod tests {
     }
 
     #[test]
+    fn custom_request_template_extracts_openai_user_prompt_after_json_render() {
+        let preset = CustomApiPreset {
+            request_template:
+                r#"{"messages":[{"role":"system","content":"ignore"},{"role":"user","content":"{OCR_TEXT}"}]}"#
+                    .to_owned(),
+            ..Default::default()
+        };
+
+        let prompt = build_prompt("line \"one\"\nline two", Some(&preset), "ja", "ko", false);
+
+        assert_eq!(prompt, "line \"one\"\nline two");
+    }
+
+    #[test]
+    fn custom_request_template_normalizes_object_fragment_and_extracts_text() {
+        let preset = CustomApiPreset {
+            request_template: r#""text":"{OCR_TEXT}","source":"{SOURCE_CODE}""#.to_owned(),
+            ..Default::default()
+        };
+
+        let prompt = build_prompt("번역 대상", Some(&preset), "ja", "ko", false);
+
+        assert_eq!(prompt, "번역 대상");
+    }
+
+    #[test]
+    fn mort_cli_raw_default_prompt_wraps_plain_text_for_translation() {
+        let prompt = build_prompt("こんにちは", None, "ja", "ko", true);
+
+        assert!(prompt.contains("Translate from Japanese to Korean"));
+        assert!(prompt.contains("TEXT:\nこんにちは"));
+    }
+
+    #[test]
     fn invalid_custom_response_template_falls_back_to_mort_json() {
         let preset = CustomApiPreset {
-            response_template: "\"translated\":\"{RESULT_TEXT}\",".to_owned(),
+            response_template: "[".to_owned(),
             ..Default::default()
         };
 

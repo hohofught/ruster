@@ -642,6 +642,40 @@ async fn forward_prompt_with_options(
         .await
 }
 
+async fn forward_cli_raw_prompt(
+    state: &ServerState,
+    prompt: &str,
+    timeout: Duration,
+    model_override: Option<&str>,
+) -> Result<String, HostError> {
+    let settings_snapshot = state.settings.read().clone();
+    let backend_scope = format!(
+        "cli:{}",
+        model_catalog::normalize_cli_model(&settings_snapshot.gemini_cli_model)
+    );
+    let model_scope = model_override
+        .and_then(model_catalog::find_cli)
+        .map(|model| model.id.to_owned())
+        .unwrap_or_else(|| "selected".to_owned());
+    let key = format!(
+        "forward:cli-raw:{backend_scope}:{model_scope}:{}:{}",
+        prompt.len(),
+        diagnostics::fingerprint(prompt)
+    );
+    let request_id = diagnostics::next_request_id();
+    let host = state.host.clone();
+    let prompt = prompt.to_owned();
+    let model_override = model_override.map(ToOwned::to_owned);
+
+    state
+        .dedup
+        .run(key, "Forward", request_id, "cli-raw", move || async move {
+            host.send_cli_raw_prompt(&prompt, timeout, model_override.as_deref())
+                .await
+        })
+        .await
+}
+
 fn prepare_prompt_for_forwarding(
     state: &ServerState,
     prompt: &str,
@@ -1563,31 +1597,49 @@ async fn handle_mort(
         },
         None => None,
     };
+    let settings_snapshot = state.settings.read().clone();
+    let host_raw_mode = state.host.raw_prompt_mode();
+    let use_mort_cli_raw = settings_snapshot.mort_cli_raw_mode;
     let prompt = custom_api::build_prompt(
         &incoming.text,
         preset.as_ref(),
         &incoming.source_code,
         &incoming.result_code,
+        use_mort_cli_raw && preset.is_none() && !host_raw_mode,
     );
     let raw_prompt = preset
         .as_ref()
         .map(|p| p.mode.eq_ignore_ascii_case(custom_api::MODE_RAW_PROMPT))
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || host_raw_mode;
     let timeout = Duration::from_secs(preset.as_ref().map(|p| p.timeout_seconds).unwrap_or(60));
     let detected_study = detect_ivlyrics_study_category(&incoming.text, &prompt);
-    let route_study_to_cli = {
-        let settings = state.settings.read();
-        detected_study.is_some() && settings.iv_lyrics_study_cli_direct_enabled
-    };
+    let route_study_to_cli =
+        detected_study.is_some() && settings_snapshot.iv_lyrics_study_cli_direct_enabled;
     let forward_input = if route_study_to_cli {
         select_ivlyrics_study_raw_prompt(&incoming.text, &prompt)
     } else {
         prompt.as_str()
     };
+    let prompt_mode = if route_study_to_cli {
+        "iv-study-cli"
+    } else if use_mort_cli_raw {
+        if preset.is_some() {
+            "custom-cli-raw"
+        } else if host_raw_mode {
+            "raw-body-cli-raw"
+        } else {
+            "default-translate-cli-raw"
+        }
+    } else if raw_prompt {
+        "raw"
+    } else {
+        "translate"
+    };
 
     let request_id = diagnostics::next_request_id();
     state.logs.push(format!(
-        "[CustomApi#{request_id}] 요청 (path={path}, preset={}, raw={raw_prompt}, ivStudy={}, ivStudyCliDirect={}, textHash={}, promptHash={}, sendHash={}, {})",
+        "[CustomApi#{request_id}] 요청 (path={path}, preset={}, mode={prompt_mode}, raw={raw_prompt}, mortCliRaw={use_mort_cli_raw}, ivStudy={}, ivStudyCliDirect={}, textHash={}, promptHash={}, sendHash={}, {})",
         preset.as_ref().map(|p| p.name.as_str()).unwrap_or(""),
         detected_study.as_deref().unwrap_or("None"),
         route_study_to_cli,
@@ -1597,16 +1649,20 @@ async fn handle_mort(
         summarize_text(&incoming.text, 100)
     ));
 
-    let translation = match forward_prompt_with_options(
-        state,
-        forward_input,
-        raw_prompt || route_study_to_cli,
-        timeout,
-        route_study_to_cli,
-        None,
-    )
-    .await
-    {
+    let forwarded = if use_mort_cli_raw && !route_study_to_cli {
+        forward_cli_raw_prompt(state, forward_input, timeout, None).await
+    } else {
+        forward_prompt_with_options(
+            state,
+            forward_input,
+            raw_prompt || route_study_to_cli,
+            timeout,
+            route_study_to_cli,
+            None,
+        )
+        .await
+    };
+    let translation = match forwarded {
         Ok(result) => result,
         Err(error) => {
             return map_host_error(CUSTOM_API_PROVIDER, path, forward_input, state, error);

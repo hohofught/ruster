@@ -58,6 +58,10 @@ impl AppPaths {
         self.data_dir.join("prompts.json")
     }
 
+    pub fn prompt_preset_dir(&self) -> PathBuf {
+        self.data_dir.join("PromptPresets")
+    }
+
     #[allow(dead_code)]
     pub fn webview_user_data_dir(&self, profile_name: &str) -> PathBuf {
         self.data_dir

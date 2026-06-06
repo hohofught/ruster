@@ -17,6 +17,7 @@ pub struct AppSettings {
     pub require_proxy_api_key: bool,
     pub local_api_key: String,
     pub raw_prompt_mode: bool,
+    pub mort_cli_raw_mode: bool,
     pub gemini_cli_model: String,
     pub gemini_cli_timeout_seconds: u64,
     pub gemini_cli_verified_model_ids: Vec<String>,
@@ -52,6 +53,7 @@ impl Default for AppSettings {
             require_proxy_api_key: true,
             local_api_key: generate_local_api_key(),
             raw_prompt_mode: false,
+            mort_cli_raw_mode: true,
             gemini_cli_model: model_catalog::DEFAULT_CLI_MODEL_ID.to_owned(),
             gemini_cli_timeout_seconds: 120,
             gemini_cli_verified_model_ids: Vec::new(),
@@ -381,6 +383,17 @@ mod tests {
 
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains(r#""IvLyricsStudyCliDirectEnabled":true"#));
+    }
+
+    #[test]
+    fn mort_cli_raw_mode_defaults_on_and_uses_pascal_case_contract() {
+        let settings: AppSettings = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(settings.mort_cli_raw_mode);
+
+        let settings: AppSettings = serde_json::from_str(r#"{"MortCliRawMode":false}"#).unwrap();
+        assert!(!settings.mort_cli_raw_mode);
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""MortCliRawMode":false"#));
     }
 
     #[test]

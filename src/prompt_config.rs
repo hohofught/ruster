@@ -1,9 +1,19 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::app_paths::AppPaths;
 use crate::logging::LogBuffer;
+
+const DEFAULT_PROMPT_ID: &str = "default";
+const CURRENT_PROMPT_ID: &str = "current";
+const JAPANESE_EXPRESSIVE_PROMPT_ID: &str = "embedded:japanese-expressive-translation-optimized";
+const EXPERIMENTAL_PROMPT_ID: &str = "embedded:experimental-lyric-translation";
+const JAPANESE_EXPRESSIVE_PROMPT_DOCUMENT: &str =
+    include_str!("../assets/prompt_presets/japanese-expressive-translation-optimized.txt");
+const EXPERIMENTAL_PROMPT_DOCUMENT: &str =
+    include_str!("../assets/prompt_presets/experimental-lyric-translation.txt");
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -12,6 +22,23 @@ pub struct PromptConfig {
     pub phonetic: PhoneticPromptConfig,
     #[serde(rename = "ivLyrics")]
     pub iv_lyrics: IvLyricsPromptConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct PromptPresetInfo {
+    pub id: String,
+    pub display_name: String,
+    pub is_user_preset: bool,
+}
+
+impl PromptPresetInfo {
+    fn new(id: impl Into<String>, display_name: impl Into<String>, is_user_preset: bool) -> Self {
+        Self {
+            id: id.into(),
+            display_name: display_name.into(),
+            is_user_preset,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -166,6 +193,102 @@ impl PromptConfig {
         Self::default_config().editable_document()
     }
 
+    pub fn prompt_presets(paths: &AppPaths) -> Vec<PromptPresetInfo> {
+        let mut presets = vec![
+            PromptPresetInfo::new(DEFAULT_PROMPT_ID, "기본 프롬프트", false),
+            PromptPresetInfo::new(
+                JAPANESE_EXPRESSIVE_PROMPT_ID,
+                "일본어 감성 번역 최적화 프롬프트",
+                false,
+            ),
+            PromptPresetInfo::new(EXPERIMENTAL_PROMPT_ID, "실험 프롬프트", false),
+            PromptPresetInfo::new(CURRENT_PROMPT_ID, "현재 적용 프롬프트", false),
+        ];
+
+        for preset_path in enumerate_user_preset_files(paths) {
+            let name = preset_path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("prompt")
+                .to_owned();
+            presets.push(PromptPresetInfo::new(
+                format!("user:{name}"),
+                format!("사용자 프리셋: {name}"),
+                true,
+            ));
+        }
+
+        presets
+    }
+
+    pub fn load_prompt_preset_document(
+        paths: &AppPaths,
+        logs: &LogBuffer,
+        preset_id: &str,
+    ) -> Result<String, String> {
+        match preset_id {
+            DEFAULT_PROMPT_ID => Ok(Self::default_editable_document()),
+            CURRENT_PROMPT_ID => Ok(Self::load(paths, logs).editable_document()),
+            JAPANESE_EXPRESSIVE_PROMPT_ID => {
+                normalize_editable_document(JAPANESE_EXPRESSIVE_PROMPT_DOCUMENT)
+            }
+            EXPERIMENTAL_PROMPT_ID => normalize_editable_document(EXPERIMENTAL_PROMPT_DOCUMENT),
+            _ => {
+                let Some(path) = user_preset_path_by_id(paths, preset_id) else {
+                    return Err("프롬프트 프리셋을 찾을 수 없습니다.".to_owned());
+                };
+                std::fs::read_to_string(&path)
+                    .map_err(|error| format!("프롬프트 프리셋 로드 실패: {error}"))
+                    .and_then(|document| normalize_editable_document(&document))
+            }
+        }
+    }
+
+    pub fn save_user_preset_document(
+        paths: &AppPaths,
+        document: &str,
+    ) -> Result<PromptPresetInfo, String> {
+        let normalized = normalize_editable_document(document)?;
+        paths.ensure_data_dir();
+        std::fs::create_dir_all(paths.prompt_preset_dir())
+            .map_err(|error| format!("프롬프트 프리셋 폴더 생성 실패: {error}"))?;
+
+        let base_name = format!("prompt-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+        let mut path = paths.prompt_preset_dir().join(format!("{base_name}.txt"));
+        let mut suffix = 2;
+        while path.exists() {
+            path = paths
+                .prompt_preset_dir()
+                .join(format!("{base_name}-{suffix}.txt"));
+            suffix += 1;
+        }
+
+        std::fs::write(&path, normalized)
+            .map_err(|error| format!("프롬프트 프리셋 저장 실패: {error}"))?;
+        let name = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("prompt")
+            .to_owned();
+        Ok(PromptPresetInfo::new(
+            format!("user:{name}"),
+            format!("사용자 프리셋: {name}"),
+            true,
+        ))
+    }
+
+    pub fn delete_user_preset(paths: &AppPaths, preset_id: &str) -> Result<(), String> {
+        if !preset_id.starts_with("user:") {
+            return Err("사용자 프리셋만 삭제할 수 있습니다.".to_owned());
+        }
+
+        let Some(path) = user_preset_path_by_id(paths, preset_id) else {
+            return Err("프롬프트 프리셋을 찾을 수 없습니다.".to_owned());
+        };
+
+        std::fs::remove_file(&path).map_err(|error| format!("프롬프트 프리셋 삭제 실패: {error}"))
+    }
+
     pub fn save_user_override_document(
         paths: &AppPaths,
         document: &str,
@@ -294,6 +417,61 @@ fn append_document_blocks(out: &mut String, key: &str, values: &[String]) {
     for value in values {
         append_document_block(out, key, value);
     }
+}
+
+fn normalize_editable_document(document: &str) -> Result<String, String> {
+    if document.trim().is_empty() {
+        return Err("프롬프트 문서가 비어 있습니다.".to_owned());
+    }
+
+    let config = if document.trim_start().starts_with('{') {
+        serde_json::from_str::<PromptConfig>(document)
+            .map_err(|error| format!("프롬프트 JSON 형식이 올바르지 않습니다: {error}"))?
+    } else {
+        parse_editable_document(document)?
+    };
+
+    Ok(config.editable_document())
+}
+
+fn enumerate_user_preset_files(paths: &AppPaths) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(paths.prompt_preset_dir()) else {
+        return Vec::new();
+    };
+
+    let mut files = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("txt"))
+        })
+        .collect::<Vec<_>>();
+
+    files.sort_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    });
+    files.reverse();
+    files
+}
+
+fn user_preset_path_by_id(paths: &AppPaths, preset_id: &str) -> Option<PathBuf> {
+    enumerate_user_preset_files(paths)
+        .into_iter()
+        .find(|path| user_preset_id_for_path(path) == preset_id)
+}
+
+fn user_preset_id_for_path(path: &Path) -> String {
+    let name = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("prompt");
+    format!("user:{name}")
 }
 
 fn append_document_block(out: &mut String, key: &str, value: &str) {
@@ -485,6 +663,20 @@ mod tests {
                 .contains("{targetLanguage}")
         );
         assert!(config.translation.prefix.contains("[N]"));
+    }
+
+    #[test]
+    fn embedded_prompt_presets_are_valid_editable_documents() {
+        for document in [
+            JAPANESE_EXPRESSIVE_PROMPT_DOCUMENT,
+            EXPERIMENTAL_PROMPT_DOCUMENT,
+        ] {
+            let document =
+                normalize_editable_document(document).expect("embedded prompt preset should parse");
+
+            assert!(document.contains("@@ translation.prefix"));
+            assert!(document.contains("@@ ivLyrics.translationTemplate"));
+        }
     }
 
     #[test]

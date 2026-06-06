@@ -496,6 +496,45 @@ impl TranslatorHost {
             .await
     }
 
+    pub async fn send_cli_raw_prompt(
+        &self,
+        prompt: &str,
+        timeout: Duration,
+        model_override: Option<&str>,
+    ) -> Result<String, HostError> {
+        self.request_guard.throw_if_active()?;
+        let _guard = self
+            .translate_lock
+            .acquire(HostRequestPriority::Normal)
+            .await;
+        self.request_guard.throw_if_active()?;
+
+        let settings = self.settings.read().clone();
+        let selected_model = model_override
+            .and_then(model_catalog::find_cli)
+            .map(|model| model.id.to_owned())
+            .unwrap_or_else(|| model_catalog::normalize_cli_model(&settings.gemini_cli_model));
+        let client = GeminiCliClient::new(
+            selected_model,
+            timeout.as_secs().max(settings.gemini_cli_timeout_seconds),
+        )
+        .with_fast_wrapper_from_settings(&settings)
+        .with_max_output_tokens(ivlyrics_raw_max_output_tokens(prompt));
+
+        let result = client.send_prompt(prompt).await;
+        match &result {
+            Ok(text) => self.logs.push(format!(
+                "[Host] MORT/custom CLI raw 응답 수신 (len={})",
+                text.len()
+            )),
+            Err(error) => self.logs.push(format!(
+                "[Host] MORT/custom CLI raw 오류: {}",
+                describe_error(error)
+            )),
+        }
+        Ok(result?)
+    }
+
     pub async fn send_ivlyrics_study_prompt_with_webview_limit_fallback(
         &self,
         prompt: &str,

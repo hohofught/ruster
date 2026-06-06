@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "ruster"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "axum",

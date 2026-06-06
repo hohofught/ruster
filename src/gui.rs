@@ -321,6 +321,7 @@ struct RusterApp {
     update_check_panel: Arc<RwLock<UpdateCheckPanelState>>,
     last_update_check_marker: String,
     show_update_check_dialog: bool,
+    selected_prompt_preset_id: String,
     prompt_editor_text: String,
     confirm_usage_reset: bool,
     show_developer_info: bool,
@@ -380,6 +381,7 @@ impl RusterApp {
             update_check_panel: Arc::new(RwLock::new(UpdateCheckPanelState::default())),
             last_update_check_marker: String::new(),
             show_update_check_dialog: false,
+            selected_prompt_preset_id: "current".to_owned(),
             prompt_editor_text,
             confirm_usage_reset: false,
             show_developer_info: false,
@@ -539,6 +541,69 @@ impl RusterApp {
     fn load_default_prompt_editor(&mut self) {
         self.prompt_editor_text = PromptConfig::default_editable_document();
         self.set_status("기본 prompts.json을 불러왔습니다. 저장해야 적용됩니다.");
+    }
+
+    fn load_selected_prompt_preset(&mut self) {
+        match PromptConfig::load_prompt_preset_document(
+            &self.paths,
+            &self.logs,
+            &self.selected_prompt_preset_id,
+        ) {
+            Ok(document) => {
+                let selected_name = PromptConfig::prompt_presets(&self.paths)
+                    .into_iter()
+                    .find(|preset| preset.id == self.selected_prompt_preset_id)
+                    .map(|preset| preset.display_name)
+                    .unwrap_or_else(|| "프롬프트 프리셋".to_owned());
+                self.prompt_editor_text = document;
+                self.set_status(format!(
+                    "{selected_name}을 불러왔습니다. 저장해야 적용됩니다."
+                ));
+            }
+            Err(error) => {
+                self.logs
+                    .push(format!("[PromptConfig] 프롬프트 프리셋 로드 실패: {error}"));
+                self.set_status(format!("프롬프트 프리셋 로드 실패: {error}"));
+            }
+        }
+    }
+
+    fn save_current_prompt_preset(&mut self) {
+        match PromptConfig::save_user_preset_document(&self.paths, &self.prompt_editor_text) {
+            Ok(preset) => {
+                self.selected_prompt_preset_id = preset.id;
+                self.set_status(format!(
+                    "프롬프트 프리셋을 추가했습니다: {}",
+                    preset.display_name
+                ));
+            }
+            Err(error) => {
+                self.logs
+                    .push(format!("[PromptConfig] 프롬프트 프리셋 저장 실패: {error}"));
+                self.set_status(format!("프롬프트 프리셋 저장 실패: {error}"));
+            }
+        }
+    }
+
+    fn delete_selected_prompt_preset(&mut self) {
+        let selected_name = PromptConfig::prompt_presets(&self.paths)
+            .into_iter()
+            .find(|preset| preset.id == self.selected_prompt_preset_id)
+            .map(|preset| preset.display_name)
+            .unwrap_or_else(|| "사용자 프리셋".to_owned());
+
+        match PromptConfig::delete_user_preset(&self.paths, &self.selected_prompt_preset_id) {
+            Ok(()) => {
+                self.selected_prompt_preset_id = "current".to_owned();
+                self.load_selected_prompt_preset();
+                self.set_status(format!("사용자 프리셋을 삭제했습니다: {selected_name}"));
+            }
+            Err(error) => {
+                self.logs
+                    .push(format!("[PromptConfig] 프롬프트 프리셋 삭제 실패: {error}"));
+                self.set_status(format!("프롬프트 프리셋 삭제 실패: {error}"));
+            }
+        }
     }
 
     fn save_prompt_editor(&mut self) {
@@ -1272,11 +1337,22 @@ impl RusterApp {
     fn draw_prompt_section(&mut self, ui: &mut egui::Ui) {
         self.section_anchor(ui, AppPage::Prompt);
         draw_card(ui, "프롬프트 / ivLyrics", |ui| {
+            toggle_row(ui, &mut self.draft.mort_cli_raw_mode, "MORT CLI Raw 사용");
+            ui.horizontal(|ui| {
+                ui.add_space(22.0);
+                ui.label(
+                    RichText::new(
+                        "MORT/root/custom 요청은 WebView 대신 Gemini CLI raw 경로로 처리합니다.",
+                    )
+                    .color(muted_text()),
+                );
+            });
+            ui.add_space(8.0);
             toggle_row(ui, &mut self.draft.raw_prompt_mode, "Raw Prompt 모드");
             ui.horizontal(|ui| {
                 ui.add_space(22.0);
                 ui.label(
-                    RichText::new("호환 API/루트 요청 본문을 번역 래핑 없이 그대로 보냅니다.")
+                    RichText::new("루트 요청 본문을 번역 래핑 없이 그대로 보냅니다.")
                         .color(muted_text()),
                 );
             });
@@ -1326,6 +1402,63 @@ impl RusterApp {
                         self.load_default_prompt_editor();
                     }
                 });
+            });
+            ui.add_space(10.0);
+            let presets = PromptConfig::prompt_presets(&self.paths);
+            if !presets
+                .iter()
+                .any(|preset| preset.id == self.selected_prompt_preset_id)
+            {
+                self.selected_prompt_preset_id = presets
+                    .first()
+                    .map(|preset| preset.id.clone())
+                    .unwrap_or_else(|| "default".to_owned());
+            }
+            let selected_preset_name = presets
+                .iter()
+                .find(|preset| preset.id == self.selected_prompt_preset_id)
+                .map(|preset| preset.display_name.as_str())
+                .unwrap_or("프리셋 선택");
+            let selected_is_user_preset = presets
+                .iter()
+                .find(|preset| preset.id == self.selected_prompt_preset_id)
+                .map(|preset| preset.is_user_preset)
+                .unwrap_or(false);
+            let mut preset_changed = false;
+            ui.horizontal(|ui| {
+                ui.label("프리셋");
+                egui::ComboBox::from_id_salt("prompt_preset_combo")
+                    .selected_text(selected_preset_name)
+                    .width(300.0)
+                    .show_ui(ui, |ui| {
+                        for preset in &presets {
+                            if ui
+                                .selectable_value(
+                                    &mut self.selected_prompt_preset_id,
+                                    preset.id.clone(),
+                                    &preset.display_name,
+                                )
+                                .changed()
+                            {
+                                preset_changed = true;
+                            }
+                        }
+                    });
+                if preset_changed {
+                    self.load_selected_prompt_preset();
+                }
+                if ui.button("불러오기").clicked() {
+                    self.load_selected_prompt_preset();
+                }
+                if ui.button("현재 내용 추가").clicked() {
+                    self.save_current_prompt_preset();
+                }
+                if ui
+                    .add_enabled(selected_is_user_preset, egui::Button::new("삭제"))
+                    .clicked()
+                {
+                    self.delete_selected_prompt_preset();
+                }
             });
             ui.add_space(10.0);
             ui.add_sized(
