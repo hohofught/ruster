@@ -17,6 +17,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, oneshot};
 
 use crate::app_paths::AppPaths;
+use crate::auto_prompt;
 use crate::custom_api::{self, CustomApiPresetService};
 use crate::diagnostics;
 use crate::host::{HostError, TranslatorHost};
@@ -41,6 +42,7 @@ const LISTENER_MAX_RETRIES: usize = 5;
 
 #[derive(Clone)]
 pub struct ServerState {
+    paths: AppPaths,
     settings: Arc<RwLock<AppSettings>>,
     host: Arc<TranslatorHost>,
     logs: LogBuffer,
@@ -63,6 +65,7 @@ pub async fn serve(
     let usage = UsageMetrics::new(&paths, logs.clone());
     let custom_presets = CustomApiPresetService::new(&paths, logs.clone());
     let state = ServerState {
+        paths: paths.clone(),
         settings: settings.clone(),
         host,
         logs: logs.clone(),
@@ -592,22 +595,29 @@ async fn forward_prompt_with_options(
     prompt: &str,
     raw: bool,
     timeout: Duration,
-    force_cli: bool,
+    cli_route: Option<ivlyrics::IvLyricsPromptKind>,
     model_override: Option<&str>,
+    translation_target: Option<&str>,
 ) -> Result<String, HostError> {
-    if force_cli {
+    if let Some(kind) = cli_route {
         let request_id = diagnostics::next_request_id();
+        let route_label = ivlyrics_direct_route_label(kind);
         state.logs.push(format!(
-            "[Forward#{request_id}] ivLyrics study fast lane: dedup/merge 우회, raw CLI 전송 (len={}, hash={})",
+            "[Forward#{request_id}] {route_label} fast lane: dedup/merge 우회, raw CLI 전송 (len={}, hash={})",
             prompt.len(),
             diagnostics::fingerprint(prompt)
         ));
         return state
             .host
-            .send_ivlyrics_study_prompt_with_webview_limit_fallback(prompt, timeout)
+            .send_ivlyrics_direct_prompt_with_webview_limit_fallback(prompt, timeout, kind)
             .await;
     }
 
+    let backend_prompt = if raw {
+        prompt.to_owned()
+    } else {
+        build_translation_forward_prompt(prompt, translation_target)
+    };
     let settings_snapshot = state.settings.read().clone();
     let backend_scope = format!(
         "cli:{}",
@@ -620,24 +630,18 @@ async fn forward_prompt_with_options(
         .unwrap_or_else(|| "selected".to_owned());
     let key = format!(
         "forward:{mode}:{backend_scope}:{model_scope}:{}:{}",
-        prompt.len(),
-        diagnostics::fingerprint(prompt)
+        backend_prompt.len(),
+        diagnostics::fingerprint(&backend_prompt)
     );
     let request_id = diagnostics::next_request_id();
     let host = state.host.clone();
-    let prompt = prompt.to_owned();
     let model_override = model_override.map(ToOwned::to_owned);
 
     state
         .dedup
         .run(key, "Forward", request_id, mode, move || async move {
-            if raw {
-                host.send_raw_prompt_with_model(&prompt, timeout, model_override.as_deref())
-                    .await
-            } else {
-                host.translate_with_model(&prompt, timeout, model_override.as_deref())
-                    .await
-            }
+            host.send_raw_prompt_with_model(&backend_prompt, timeout, model_override.as_deref())
+                .await
         })
         .await
 }
@@ -676,7 +680,36 @@ async fn forward_cli_raw_prompt(
         .await
 }
 
-fn prepare_prompt_for_forwarding(
+fn build_translation_forward_prompt(text: &str, target: Option<&str>) -> String {
+    let target = normalize_translation_target(target);
+    format!(
+        "Translate the following text to {target}.\n\n\
+Rules:\n\
+- Output only the translated text.\n\
+- Preserve line breaks and simple formatting.\n\
+- Do not add explanations, summaries, quotes, Markdown, or code fences.\n\
+- If a line is already in the target language, keep it natural and do not invent new content.\n\n\
+INPUT_TEXT_START\n{}\nINPUT_TEXT_END\nOUTPUT_TEXT_START",
+        text.trim_end()
+    )
+}
+
+fn normalize_translation_target(target: Option<&str>) -> String {
+    let value = target.unwrap_or("").trim();
+    if value.is_empty() {
+        return "Korean (한국어)".to_owned();
+    }
+
+    match value.to_ascii_lowercase().as_str() {
+        "ko" | "kor" | "ko-kr" | "korean" => "Korean (한국어)".to_owned(),
+        "en" | "eng" | "en-us" | "en-gb" | "english" => "English".to_owned(),
+        "ja" | "jpn" | "jp" | "ja-jp" | "japanese" => "Japanese (日本語)".to_owned(),
+        "zh" | "zho" | "zh-cn" | "zh-tw" | "chinese" => "Chinese (中文)".to_owned(),
+        _ => value.to_owned(),
+    }
+}
+
+async fn prepare_prompt_for_forwarding(
     state: &ServerState,
     prompt: &str,
     allow_ivlyrics_rewrite: bool,
@@ -688,12 +721,30 @@ fn prepare_prompt_for_forwarding(
     let detected_kind = ivlyrics::try_detect_kind(prompt);
     if allow_ivlyrics_rewrite {
         if detected_kind == Some(ivlyrics::IvLyricsPromptKind::Translation)
-            && let Some(result) = ivlyrics::try_rewrite_translation(prompt, &state.prompts)
+            && let Some(input) = ivlyrics::try_extract_translation_rewrite_input(prompt)
         {
+            let settings = state.settings.read().clone();
+            let rewritten = auto_prompt::build_translation_prompt(
+                &state.paths,
+                &state.host,
+                &settings,
+                &state.prompts,
+                &input,
+                &state.logs,
+            )
+            .await;
+            let result = ivlyrics::IvLyricsPromptRewriteResult {
+                kind: ivlyrics::IvLyricsPromptKind::Translation,
+                prompt: rewritten,
+                line_count: input.line_count,
+                strip_number_tags_from_response: true,
+                source_lines: Vec::new(),
+                original_prompt: prompt.to_owned(),
+            };
             return (result.prompt.clone(), Some(result), detected_kind);
         }
         if detected_kind == Some(ivlyrics::IvLyricsPromptKind::Phonetic)
-            && let Some(result) = ivlyrics::try_rewrite_phonetic(prompt)
+            && let Some(result) = ivlyrics::try_rewrite_phonetic(prompt, &state.prompts)
         {
             return (result.prompt.clone(), Some(result), detected_kind);
         }
@@ -704,6 +755,68 @@ fn prepare_prompt_for_forwarding(
         }
     }
     (prompt.to_owned(), None, detected_kind)
+}
+
+fn detect_ivlyrics_cli_prompt(
+    primary: &str,
+    fallback: &str,
+) -> Option<(ivlyrics::IvLyricsPromptKind, String, String)> {
+    if let Some(category) = ivlyrics::try_detect_lyrics_study_category(primary) {
+        return Some((
+            ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz,
+            category,
+            primary.to_owned(),
+        ));
+    }
+    if let Some(kind) = ivlyrics::try_detect_kind(primary)
+        && ivlyrics::is_cli_direct_prompt_kind(Some(kind))
+    {
+        return Some((kind, String::new(), primary.to_owned()));
+    }
+    if !fallback.trim().is_empty() && primary != fallback {
+        if let Some(category) = ivlyrics::try_detect_lyrics_study_category(fallback) {
+            return Some((
+                ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz,
+                category,
+                fallback.to_owned(),
+            ));
+        }
+        if let Some(kind) = ivlyrics::try_detect_kind(fallback)
+            && ivlyrics::is_cli_direct_prompt_kind(Some(kind))
+        {
+            return Some((kind, String::new(), fallback.to_owned()));
+        }
+    }
+    None
+}
+
+fn direct_cli_route_for_kind(
+    settings: &AppSettings,
+    kind: Option<ivlyrics::IvLyricsPromptKind>,
+) -> Option<ivlyrics::IvLyricsPromptKind> {
+    match kind {
+        Some(ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz)
+            if settings.iv_lyrics_study_cli_direct_enabled =>
+        {
+            Some(ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz)
+        }
+        Some(ivlyrics::IvLyricsPromptKind::Phonetic)
+        | Some(ivlyrics::IvLyricsPromptKind::CharacterPronunciation)
+            if settings.iv_lyrics_phonetic_use_cli_wrapper_enabled =>
+        {
+            kind
+        }
+        _ => None,
+    }
+}
+
+fn ivlyrics_direct_route_label(kind: ivlyrics::IvLyricsPromptKind) -> &'static str {
+    match kind {
+        ivlyrics::IvLyricsPromptKind::Phonetic => "ivLyrics pronunciation",
+        ivlyrics::IvLyricsPromptKind::CharacterPronunciation => "ivLyrics character pronunciation",
+        ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz => "ivLyrics study",
+        ivlyrics::IvLyricsPromptKind::Translation => "ivLyrics translation",
+    }
 }
 
 fn detect_ivlyrics_study_category(primary: &str, fallback: &str) -> Option<String> {
@@ -898,22 +1011,38 @@ async fn handle_openai_chat(state: &ServerState, path: &str, root: &Value) -> Re
     let custom_translate_route = path.eq_ignore_ascii_case("/custom/chat/completions")
         || path.eq_ignore_ascii_case("/v1/custom/chat/completions");
     let raw_chat_prompt = prompt.clone();
-    let detected_study = detect_ivlyrics_study_category(&latest_user_text, &raw_chat_prompt);
-    let route_study_to_cli = {
+    let direct_candidate = detect_ivlyrics_cli_prompt(&latest_user_text, &raw_chat_prompt);
+    let direct_kind = direct_candidate.as_ref().map(|(kind, _, _)| *kind);
+    let detected_study = direct_candidate
+        .as_ref()
+        .and_then(|(kind, category, _)| {
+            (*kind == ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz).then(|| category.clone())
+        })
+        .filter(|category| !category.is_empty());
+    let cli_route = {
         let settings = state.settings.read();
-        detected_study.is_some() && settings.iv_lyrics_study_cli_direct_enabled
+        direct_cli_route_for_kind(&settings, direct_kind)
     };
-    if !route_study_to_cli {
+    let route_ivlyrics_direct_to_cli = cli_route.is_some();
+    let route_ivlyrics_pronunciation_to_cli = matches!(
+        cli_route,
+        Some(
+            ivlyrics::IvLyricsPromptKind::Phonetic
+                | ivlyrics::IvLyricsPromptKind::CharacterPronunciation
+        )
+    );
+    if !route_ivlyrics_direct_to_cli {
         prompt = apply_openai_response_format_instruction(prompt, root.get("response_format"));
     }
-    let (prompt_to_send, rewrite, iv_kind) = if route_study_to_cli {
-        (
-            select_ivlyrics_study_raw_prompt(&latest_user_text, &raw_chat_prompt).to_owned(),
-            None,
-            Some(ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz),
-        )
+    let (prompt_to_send, rewrite, iv_kind) = if route_ivlyrics_direct_to_cli {
+        let (_, _, selected_prompt) = direct_candidate.unwrap_or((
+            cli_route.unwrap_or(ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz),
+            String::new(),
+            raw_chat_prompt.clone(),
+        ));
+        (selected_prompt, None, cli_route)
     } else {
-        prepare_prompt_for_forwarding(state, &prompt, !raw_mode)
+        prepare_prompt_for_forwarding(state, &prompt, true).await
     };
     let gate_kind = iv_kind.or(if detected_study.is_some() {
         Some(ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz)
@@ -922,12 +1051,13 @@ async fn handle_openai_chat(state: &ServerState, path: &str, root: &Value) -> Re
     });
 
     state.logs.push(format!(
-        "[OpenAIProxy#{request_id}] chat 요청 (path={path}, stream={stream}, raw={raw_mode}, ivKind={:?}, ivStudy={}, ivStudyCliDirect={}, rewrite={}, backend={}, promptHash={}, sendHash={}, {})",
+        "[OpenAIProxy#{request_id}] chat 요청 (path={path}, stream={stream}, raw={raw_mode}, ivKind={:?}, ivStudy={}, ivStudyCliDirect={}, ivPhoneticCli={}, rewrite={}, backend={}, promptHash={}, sendHash={}, {})",
         iv_kind,
         detected_study.as_deref().unwrap_or("None"),
-        route_study_to_cli,
+        route_ivlyrics_direct_to_cli,
+        route_ivlyrics_pronunciation_to_cli,
         rewrite.is_some(),
-        if route_study_to_cli { "iv-study-cli" } else { "selected" },
+        cli_route.map(ivlyrics_direct_route_label).unwrap_or("selected"),
         diagnostics::fingerprint(&prompt),
         diagnostics::fingerprint(&prompt_to_send),
         summarize_text(&prompt, 100)
@@ -943,8 +1073,9 @@ async fn handle_openai_chat(state: &ServerState, path: &str, root: &Value) -> Re
         &prompt_to_send,
         raw_forward,
         Duration::from_secs(150),
-        route_study_to_cli,
+        cli_route,
         Some(&model),
+        None,
     )
     .await
     {
@@ -960,7 +1091,7 @@ async fn handle_openai_chat(state: &ServerState, path: &str, root: &Value) -> Re
         request_id,
         result,
         rewrite.as_ref(),
-        if route_study_to_cli {
+        if cli_route == Some(ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz) {
             detected_study.as_deref().unwrap_or("")
         } else {
             ""
@@ -1030,22 +1161,38 @@ async fn handle_openai_responses(state: &ServerState, root: &Value) -> Response<
         .or_else(|| root.get("text").and_then(|t| t.get("format")));
     let raw_mode = state.host.raw_prompt_mode();
     let raw_response_prompt = prompt.clone();
-    let detected_study = detect_ivlyrics_study_category(&raw_response_prompt, "");
-    let route_study_to_cli = {
+    let direct_candidate = detect_ivlyrics_cli_prompt(&raw_response_prompt, "");
+    let direct_kind = direct_candidate.as_ref().map(|(kind, _, _)| *kind);
+    let detected_study = direct_candidate
+        .as_ref()
+        .and_then(|(kind, category, _)| {
+            (*kind == ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz).then(|| category.clone())
+        })
+        .filter(|category| !category.is_empty());
+    let cli_route = {
         let settings = state.settings.read();
-        should_route_ivlyrics_study_to_cli(&settings, &raw_response_prompt, "").is_some()
+        direct_cli_route_for_kind(&settings, direct_kind)
     };
-    if !route_study_to_cli {
+    let route_ivlyrics_direct_to_cli = cli_route.is_some();
+    let route_ivlyrics_pronunciation_to_cli = matches!(
+        cli_route,
+        Some(
+            ivlyrics::IvLyricsPromptKind::Phonetic
+                | ivlyrics::IvLyricsPromptKind::CharacterPronunciation
+        )
+    );
+    if !route_ivlyrics_direct_to_cli {
         prompt = apply_openai_response_format_instruction(prompt, format);
     }
-    let (prompt_to_send, rewrite, iv_kind) = if route_study_to_cli {
-        (
+    let (prompt_to_send, rewrite, iv_kind) = if route_ivlyrics_direct_to_cli {
+        let (_, _, selected_prompt) = direct_candidate.unwrap_or((
+            cli_route.unwrap_or(ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz),
+            String::new(),
             raw_response_prompt,
-            None,
-            Some(ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz),
-        )
+        ));
+        (selected_prompt, None, cli_route)
     } else {
-        prepare_prompt_for_forwarding(state, &prompt, !raw_mode)
+        prepare_prompt_for_forwarding(state, &prompt, true).await
     };
     let gate_kind = iv_kind.or(if detected_study.is_some() {
         Some(ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz)
@@ -1053,10 +1200,11 @@ async fn handle_openai_responses(state: &ServerState, root: &Value) -> Response<
         None
     });
     state.logs.push(format!(
-        "[OpenAIProxy#{request_id}] responses 요청 (stream={stream}, raw={raw_mode}, ivKind={:?}, ivStudy={}, ivStudyCliDirect={}, rewrite={}, promptHash={}, sendHash={})",
+        "[OpenAIProxy#{request_id}] responses 요청 (stream={stream}, raw={raw_mode}, ivKind={:?}, ivStudy={}, ivStudyCliDirect={}, ivPhoneticCli={}, rewrite={}, promptHash={}, sendHash={})",
         iv_kind,
         detected_study.as_deref().unwrap_or("None"),
-        route_study_to_cli,
+        route_ivlyrics_direct_to_cli,
+        route_ivlyrics_pronunciation_to_cli,
         rewrite.is_some(),
         diagnostics::fingerprint(&prompt),
         diagnostics::fingerprint(&prompt_to_send)
@@ -1070,8 +1218,9 @@ async fn handle_openai_responses(state: &ServerState, root: &Value) -> Response<
         &prompt_to_send,
         true,
         Duration::from_secs(150),
-        route_study_to_cli,
+        cli_route,
         Some(&model),
+        None,
     )
     .await
     {
@@ -1087,7 +1236,7 @@ async fn handle_openai_responses(state: &ServerState, root: &Value) -> Response<
         request_id,
         result,
         rewrite.as_ref(),
-        if route_study_to_cli {
+        if cli_route == Some(ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz) {
             detected_study.as_deref().unwrap_or("")
         } else {
             ""
@@ -1149,19 +1298,35 @@ async fn handle_openai_completions(state: &ServerState, root: &Value) -> Respons
         return openai_error_response(400, "No prompt provided");
     }
     let raw_mode = state.host.raw_prompt_mode();
-    let detected_study = detect_ivlyrics_study_category(&prompt, "");
-    let route_study_to_cli = {
+    let direct_candidate = detect_ivlyrics_cli_prompt(&prompt, "");
+    let direct_kind = direct_candidate.as_ref().map(|(kind, _, _)| *kind);
+    let detected_study = direct_candidate
+        .as_ref()
+        .and_then(|(kind, category, _)| {
+            (*kind == ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz).then(|| category.clone())
+        })
+        .filter(|category| !category.is_empty());
+    let cli_route = {
         let settings = state.settings.read();
-        should_route_ivlyrics_study_to_cli(&settings, &prompt, "").is_some()
+        direct_cli_route_for_kind(&settings, direct_kind)
     };
-    let (prompt_to_send, rewrite, iv_kind) = if route_study_to_cli {
-        (
-            prompt.clone(),
-            None,
-            Some(ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz),
+    let route_ivlyrics_direct_to_cli = cli_route.is_some();
+    let route_ivlyrics_pronunciation_to_cli = matches!(
+        cli_route,
+        Some(
+            ivlyrics::IvLyricsPromptKind::Phonetic
+                | ivlyrics::IvLyricsPromptKind::CharacterPronunciation
         )
+    );
+    let (prompt_to_send, rewrite, iv_kind) = if route_ivlyrics_direct_to_cli {
+        let (_, _, selected_prompt) = direct_candidate.unwrap_or((
+            cli_route.unwrap_or(ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz),
+            String::new(),
+            prompt.clone(),
+        ));
+        (selected_prompt, None, cli_route)
     } else {
-        prepare_prompt_for_forwarding(state, &prompt, !raw_mode)
+        prepare_prompt_for_forwarding(state, &prompt, true).await
     };
     let gate_kind = iv_kind.or(if detected_study.is_some() {
         Some(ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz)
@@ -1169,10 +1334,11 @@ async fn handle_openai_completions(state: &ServerState, root: &Value) -> Respons
         None
     });
     state.logs.push(format!(
-        "[OpenAIProxy#{request_id}] completions 요청 (stream={stream}, raw={raw_mode}, ivKind={:?}, ivStudy={}, ivStudyCliDirect={}, rewrite={}, promptHash={}, sendHash={})",
+        "[OpenAIProxy#{request_id}] completions 요청 (stream={stream}, raw={raw_mode}, ivKind={:?}, ivStudy={}, ivStudyCliDirect={}, ivPhoneticCli={}, rewrite={}, promptHash={}, sendHash={})",
         iv_kind,
         detected_study.as_deref().unwrap_or("None"),
-        route_study_to_cli,
+        route_ivlyrics_direct_to_cli,
+        route_ivlyrics_pronunciation_to_cli,
         rewrite.is_some(),
         diagnostics::fingerprint(&prompt),
         diagnostics::fingerprint(&prompt_to_send)
@@ -1186,8 +1352,9 @@ async fn handle_openai_completions(state: &ServerState, root: &Value) -> Respons
         &prompt_to_send,
         true,
         Duration::from_secs(150),
-        route_study_to_cli,
+        cli_route,
         Some(&model),
+        None,
     )
     .await
     {
@@ -1205,7 +1372,7 @@ async fn handle_openai_completions(state: &ServerState, root: &Value) -> Respons
         request_id,
         result,
         rewrite.as_ref(),
-        if route_study_to_cli {
+        if cli_route == Some(ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz) {
             detected_study.as_deref().unwrap_or("")
         } else {
             ""
@@ -1395,19 +1562,35 @@ async fn handle_gemini(
     let raw_mode = state.host.raw_prompt_mode();
     let request_id = diagnostics::next_request_id();
     let request_started_at = Instant::now();
-    let detected_study = detect_ivlyrics_study_category(&prompt, "");
-    let route_study_to_cli = {
+    let direct_candidate = detect_ivlyrics_cli_prompt(&prompt, "");
+    let direct_kind = direct_candidate.as_ref().map(|(kind, _, _)| *kind);
+    let detected_study = direct_candidate
+        .as_ref()
+        .and_then(|(kind, category, _)| {
+            (*kind == ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz).then(|| category.clone())
+        })
+        .filter(|category| !category.is_empty());
+    let cli_route = {
         let settings = state.settings.read();
-        should_route_ivlyrics_study_to_cli(&settings, &prompt, "").is_some()
+        direct_cli_route_for_kind(&settings, direct_kind)
     };
-    let (prompt_to_send, rewrite, iv_kind) = if route_study_to_cli {
-        (
-            prompt.clone(),
-            None,
-            Some(ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz),
+    let route_ivlyrics_direct_to_cli = cli_route.is_some();
+    let route_ivlyrics_pronunciation_to_cli = matches!(
+        cli_route,
+        Some(
+            ivlyrics::IvLyricsPromptKind::Phonetic
+                | ivlyrics::IvLyricsPromptKind::CharacterPronunciation
         )
+    );
+    let (prompt_to_send, rewrite, iv_kind) = if route_ivlyrics_direct_to_cli {
+        let (_, _, selected_prompt) = direct_candidate.unwrap_or((
+            cli_route.unwrap_or(ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz),
+            String::new(),
+            prompt.clone(),
+        ));
+        (selected_prompt, None, cli_route)
     } else {
-        prepare_prompt_for_forwarding(state, &prompt, !raw_mode)
+        prepare_prompt_for_forwarding(state, &prompt, true).await
     };
     let gate_kind = iv_kind.or(if detected_study.is_some() {
         Some(ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz)
@@ -1415,12 +1598,13 @@ async fn handle_gemini(
         None
     });
     state.logs.push(format!(
-        "[GeminiProxy#{request_id}] 요청 (model={requested_model}, stream={stream}, raw={raw_mode}, ivKind={:?}, ivStudy={}, ivStudyCliDirect={}, rewrite={}, backend={}, promptHash={}, sendHash={})",
+        "[GeminiProxy#{request_id}] 요청 (model={requested_model}, stream={stream}, raw={raw_mode}, ivKind={:?}, ivStudy={}, ivStudyCliDirect={}, ivPhoneticCli={}, rewrite={}, backend={}, promptHash={}, sendHash={})",
         iv_kind,
         detected_study.as_deref().unwrap_or("None"),
-        route_study_to_cli,
+        route_ivlyrics_direct_to_cli,
+        route_ivlyrics_pronunciation_to_cli,
         rewrite.is_some(),
-        if route_study_to_cli { "iv-study-cli" } else { "selected" },
+        cli_route.map(ivlyrics_direct_route_label).unwrap_or("selected"),
         diagnostics::fingerprint(&prompt),
         diagnostics::fingerprint(&prompt_to_send)
     ));
@@ -1433,8 +1617,9 @@ async fn handle_gemini(
         &prompt_to_send,
         true,
         Duration::from_secs(150),
-        route_study_to_cli,
+        cli_route,
         Some(&requested_model),
+        None,
     )
     .await
     {
@@ -1463,7 +1648,7 @@ async fn handle_gemini(
         request_id,
         result,
         rewrite.as_ref(),
-        if route_study_to_cli {
+        if cli_route == Some(ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz) {
             detected_study.as_deref().unwrap_or("")
         } else {
             ""
@@ -1607,22 +1792,49 @@ async fn handle_mort(
         &incoming.result_code,
         use_mort_cli_raw && preset.is_none() && !host_raw_mode,
     );
+    let preset_builds_prompt = preset
+        .as_ref()
+        .map(|p| !p.request_template.trim().is_empty())
+        .unwrap_or(false);
     let raw_prompt = preset
         .as_ref()
         .map(|p| p.mode.eq_ignore_ascii_case(custom_api::MODE_RAW_PROMPT))
         .unwrap_or(false)
-        || host_raw_mode;
+        || host_raw_mode
+        || preset_builds_prompt;
     let timeout = Duration::from_secs(preset.as_ref().map(|p| p.timeout_seconds).unwrap_or(60));
-    let detected_study = detect_ivlyrics_study_category(&incoming.text, &prompt);
-    let route_study_to_cli =
-        detected_study.is_some() && settings_snapshot.iv_lyrics_study_cli_direct_enabled;
-    let forward_input = if route_study_to_cli {
-        select_ivlyrics_study_raw_prompt(&incoming.text, &prompt)
+    let direct_candidate = detect_ivlyrics_cli_prompt(&incoming.text, &prompt);
+    let direct_kind = direct_candidate.as_ref().map(|(kind, _, _)| *kind);
+    let detected_study = direct_candidate
+        .as_ref()
+        .and_then(|(kind, category, _)| {
+            (*kind == ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz).then(|| category.clone())
+        })
+        .filter(|category| !category.is_empty());
+    let cli_route = {
+        let settings = state.settings.read();
+        direct_cli_route_for_kind(&settings, direct_kind)
+    };
+    let route_ivlyrics_direct_to_cli = cli_route.is_some();
+    let route_ivlyrics_pronunciation_to_cli = matches!(
+        cli_route,
+        Some(
+            ivlyrics::IvLyricsPromptKind::Phonetic
+                | ivlyrics::IvLyricsPromptKind::CharacterPronunciation
+        )
+    );
+    let forward_input = if route_ivlyrics_direct_to_cli {
+        direct_candidate
+            .as_ref()
+            .map(|(_, _, selected_prompt)| selected_prompt.as_str())
+            .unwrap_or(prompt.as_str())
     } else {
         prompt.as_str()
     };
-    let prompt_mode = if route_study_to_cli {
-        "iv-study-cli"
+    let prompt_mode = if route_ivlyrics_direct_to_cli {
+        cli_route
+            .map(ivlyrics_direct_route_label)
+            .unwrap_or("iv-direct-cli")
     } else if use_mort_cli_raw {
         if preset.is_some() {
             "custom-cli-raw"
@@ -1639,26 +1851,30 @@ async fn handle_mort(
 
     let request_id = diagnostics::next_request_id();
     state.logs.push(format!(
-        "[CustomApi#{request_id}] 요청 (path={path}, preset={}, mode={prompt_mode}, raw={raw_prompt}, mortCliRaw={use_mort_cli_raw}, ivStudy={}, ivStudyCliDirect={}, textHash={}, promptHash={}, sendHash={}, {})",
+        "[CustomApi#{request_id}] 요청 (path={path}, preset={}, mode={prompt_mode}, raw={raw_prompt}, mortCliRaw={use_mort_cli_raw}, ivKind={:?}, ivStudy={}, ivStudyCliDirect={}, ivPhoneticCli={}, backend={}, textHash={}, promptHash={}, sendHash={}, {})",
         preset.as_ref().map(|p| p.name.as_str()).unwrap_or(""),
+        direct_kind,
         detected_study.as_deref().unwrap_or("None"),
-        route_study_to_cli,
+        route_ivlyrics_direct_to_cli,
+        route_ivlyrics_pronunciation_to_cli,
+        cli_route.map(ivlyrics_direct_route_label).unwrap_or("selected"),
         diagnostics::fingerprint(&incoming.text),
         diagnostics::fingerprint(&prompt),
         diagnostics::fingerprint(forward_input),
         summarize_text(&incoming.text, 100)
     ));
 
-    let forwarded = if use_mort_cli_raw && !route_study_to_cli {
+    let forwarded = if use_mort_cli_raw && !route_ivlyrics_direct_to_cli {
         forward_cli_raw_prompt(state, forward_input, timeout, None).await
     } else {
         forward_prompt_with_options(
             state,
             forward_input,
-            raw_prompt || route_study_to_cli,
+            raw_prompt || route_ivlyrics_direct_to_cli,
             timeout,
-            route_study_to_cli,
+            cli_route,
             None,
+            Some(&incoming.result_code),
         )
         .await
     };
@@ -1811,7 +2027,8 @@ async fn normalize_forwarded_ivlyrics_result(
                     &repair_prompt,
                     true,
                     timeout,
-                    false,
+                    None,
+                    None,
                     None,
                 )
                 .await
@@ -2471,6 +2688,15 @@ Input lines:\n[{\"index\":0,\"text\":\"hello\"}]";
     fn retry_stale_detection_is_case_insensitive_and_trimmed() {
         assert!(is_retry_stale(" Retry_Stale\r\n"));
         assert!(!is_retry_stale("Retry_Stale extra"));
+    }
+
+    #[test]
+    fn translation_forward_prompt_wraps_plain_text_for_translate_mode() {
+        let prompt = build_translation_forward_prompt("hello\nworld\n", Some("ko"));
+
+        assert!(prompt.contains("Translate the following text to Korean (한국어)."));
+        assert!(prompt.contains("INPUT_TEXT_START\nhello\nworld\nINPUT_TEXT_END"));
+        assert!(prompt.contains("Output only the translated text."));
     }
 
     #[test]

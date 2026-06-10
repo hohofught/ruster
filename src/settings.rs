@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::app_paths::AppPaths;
+use crate::i18n::normalize_ui_language;
 use crate::model_catalog;
 use chrono::{DateTime, Utc};
 
@@ -26,7 +27,12 @@ pub struct AppSettings {
     pub gemini_cli_verified_wrapper_source: String,
     pub iv_lyrics_quiz_enabled: bool,
     pub iv_lyrics_quiz_detailed_enabled: bool,
+    #[serde(alias = "IvLyricsQuizCliFallbackEnabled")]
     pub iv_lyrics_study_cli_direct_enabled: bool,
+    pub iv_lyrics_auto_prompt_selection_enabled: bool,
+    pub iv_lyrics_phonetic_use_cli_wrapper_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iv_lyrics_phonetic_use_chat_gpt_web_view_enabled: Option<bool>,
     pub iv_lyrics_quiz_cli_model: String,
     pub gemini_cli_use_fast_wrapper: bool,
     pub iv_lyrics_quiz_fast_cli_wrapper_enabled: bool,
@@ -38,6 +44,7 @@ pub struct AppSettings {
     pub web_view_raw_mode: bool,
     pub web_view_idle_refresh_seconds: u32,
     pub theme_mode: String,
+    pub ui_language: String,
 }
 
 impl Default for AppSettings {
@@ -63,6 +70,9 @@ impl Default for AppSettings {
             iv_lyrics_quiz_enabled: true,
             iv_lyrics_quiz_detailed_enabled: false,
             iv_lyrics_study_cli_direct_enabled: false,
+            iv_lyrics_auto_prompt_selection_enabled: true,
+            iv_lyrics_phonetic_use_cli_wrapper_enabled: false,
+            iv_lyrics_phonetic_use_chat_gpt_web_view_enabled: None,
             iv_lyrics_quiz_cli_model: model_catalog::DEFAULT_CLI_MODEL_ID.to_owned(),
             gemini_cli_use_fast_wrapper: true,
             iv_lyrics_quiz_fast_cli_wrapper_enabled: true,
@@ -74,6 +84,7 @@ impl Default for AppSettings {
             web_view_raw_mode: false,
             web_view_idle_refresh_seconds: 60,
             theme_mode: "System".to_owned(),
+            ui_language: "Korean".to_owned(),
         }
     }
 }
@@ -185,6 +196,7 @@ impl AppSettings {
         self.web_view_refresh_every_requests = self.web_view_refresh_every_requests.clamp(1, 200);
         self.web_view_idle_refresh_seconds = self.web_view_idle_refresh_seconds.clamp(10, 600);
         self.theme_mode = normalize_theme_mode(&self.theme_mode);
+        self.ui_language = normalize_ui_language(&self.ui_language);
         self.local_api_key = normalize_local_api_key(&self.local_api_key);
         if self.local_api_key.is_empty() {
             self.local_api_key = generate_local_api_key();
@@ -196,6 +208,13 @@ impl AppSettings {
         self.show_console = self.verbose_logs;
         self.iv_lyrics_quiz_enabled = true;
         self.iv_lyrics_quiz_detailed_enabled = false;
+        if self
+            .iv_lyrics_phonetic_use_chat_gpt_web_view_enabled
+            .unwrap_or(false)
+        {
+            self.iv_lyrics_phonetic_use_cli_wrapper_enabled = true;
+        }
+        self.iv_lyrics_phonetic_use_chat_gpt_web_view_enabled = None;
         self.iv_lyrics_quiz_fast_cli_wrapper_enabled = self.gemini_cli_use_fast_wrapper;
         self
     }
@@ -331,6 +350,7 @@ mod tests {
             web_view_idle_refresh_seconds: 1,
             local_api_key: "  rst-local  ".to_owned(),
             theme_mode: "dark".to_owned(),
+            ui_language: "en-us".to_owned(),
             ..Default::default()
         }
         .normalized();
@@ -342,11 +362,14 @@ mod tests {
         assert!(settings.iv_lyrics_quiz_enabled);
         assert!(!settings.iv_lyrics_quiz_detailed_enabled);
         assert!(!settings.iv_lyrics_quiz_fast_cli_wrapper_enabled);
+        assert!(settings.iv_lyrics_auto_prompt_selection_enabled);
+        assert!(!settings.iv_lyrics_phonetic_use_cli_wrapper_enabled);
         assert_eq!(settings.gemini_cli_timeout_seconds, 5);
         assert_eq!(settings.web_view_refresh_every_requests, 1);
         assert_eq!(settings.web_view_idle_refresh_seconds, 10);
         assert_eq!(settings.local_api_key, "rst-local");
         assert_eq!(settings.theme_mode, "Dark");
+        assert_eq!(settings.ui_language, "English");
     }
 
     #[test]
@@ -394,6 +417,25 @@ mod tests {
         assert!(!settings.mort_cli_raw_mode);
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains(r#""MortCliRawMode":false"#));
+    }
+
+    #[test]
+    fn ivlyrics_study_cli_direct_accepts_csharp_setting_alias() {
+        let settings: AppSettings =
+            serde_json::from_str(r#"{"IvLyricsQuizCliFallbackEnabled":true}"#).unwrap();
+        assert!(settings.iv_lyrics_study_cli_direct_enabled);
+    }
+
+    #[test]
+    fn ivlyrics_phonetic_cli_wrapper_accepts_legacy_chatgpt_field() {
+        let settings: AppSettings =
+            serde_json::from_str(r#"{"IvLyricsPhoneticUseChatGptWebViewEnabled":true}"#).unwrap();
+        let settings = settings.normalized();
+
+        assert!(settings.iv_lyrics_phonetic_use_cli_wrapper_enabled);
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""IvLyricsPhoneticUseCliWrapperEnabled":true"#));
+        assert!(!json.contains("IvLyricsPhoneticUseChatGptWebViewEnabled"));
     }
 
     #[test]

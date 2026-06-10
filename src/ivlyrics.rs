@@ -8,6 +8,7 @@ use crate::prompt_config::PromptConfig;
 pub enum IvLyricsPromptKind {
     Translation,
     Phonetic,
+    CharacterPronunciation,
     LyricsStudyQuiz,
 }
 
@@ -20,6 +21,16 @@ pub struct IvLyricsPromptRewriteResult {
     pub strip_number_tags_from_response: bool,
     pub source_lines: Vec<String>,
     pub original_prompt: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct IvLyricsTranslationRewriteInput {
+    pub line_count: usize,
+    #[allow(dead_code)]
+    pub lyrics: String,
+    pub numbered_lyrics: String,
+    pub target_language: String,
+    pub use_korean_instructions: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,6 +95,29 @@ pub fn try_rewrite_translation(
     prompt: &str,
     config: &PromptConfig,
 ) -> Option<IvLyricsPromptRewriteResult> {
+    let input = try_extract_translation_rewrite_input(prompt)?;
+    let rewritten = if input.use_korean_instructions {
+        config.build_translation_prompt(&input.target_language, &input.numbered_lyrics)
+    } else {
+        config.build_translation_prompt_english_instructions(
+            &input.target_language,
+            &input.numbered_lyrics,
+        )
+    };
+
+    Some(IvLyricsPromptRewriteResult {
+        kind: IvLyricsPromptKind::Translation,
+        prompt: rewritten,
+        line_count: input.line_count,
+        strip_number_tags_from_response: true,
+        source_lines: Vec::new(),
+        original_prompt: prompt.to_owned(),
+    })
+}
+
+pub fn try_extract_translation_rewrite_input(
+    prompt: &str,
+) -> Option<IvLyricsTranslationRewriteInput> {
     if !looks_like_translation_prompt(prompt) {
         return None;
     }
@@ -92,24 +126,21 @@ pub fn try_rewrite_translation(
     let line_count =
         normalize_line_count_and_pad(&mut lyrics, extract_translation_line_count(prompt));
     let target_language = extract_translation_target(prompt);
-    let numbered = build_numbered_input_lines(&lyrics);
-    let rewritten = if is_korean_translation_target(&target_language) {
-        config.build_translation_prompt(&target_language, &numbered)
-    } else {
-        config.build_translation_prompt_english_instructions(&target_language, &numbered)
-    };
-
-    Some(IvLyricsPromptRewriteResult {
-        kind: IvLyricsPromptKind::Translation,
-        prompt: rewritten,
+    let numbered_lyrics = build_numbered_input_lines(&lyrics);
+    let use_korean_instructions = is_korean_translation_target(&target_language);
+    Some(IvLyricsTranslationRewriteInput {
         line_count,
-        strip_number_tags_from_response: true,
-        source_lines: Vec::new(),
-        original_prompt: prompt.to_owned(),
+        lyrics,
+        numbered_lyrics,
+        target_language,
+        use_korean_instructions,
     })
 }
 
-pub fn try_rewrite_phonetic(prompt: &str) -> Option<IvLyricsPromptRewriteResult> {
+pub fn try_rewrite_phonetic(
+    prompt: &str,
+    _config: &PromptConfig,
+) -> Option<IvLyricsPromptRewriteResult> {
     if !looks_like_phonetic_prompt(prompt) {
         return None;
     }
@@ -200,11 +231,24 @@ pub fn try_detect_kind(prompt: &str) -> Option<IvLyricsPromptKind> {
         Some(IvLyricsPromptKind::Translation)
     } else if looks_like_phonetic_prompt(prompt) {
         Some(IvLyricsPromptKind::Phonetic)
+    } else if looks_like_character_pronunciation_prompt(prompt) {
+        Some(IvLyricsPromptKind::CharacterPronunciation)
     } else if is_lyrics_study_quiz_prompt(prompt) {
         Some(IvLyricsPromptKind::LyricsStudyQuiz)
     } else {
         None
     }
+}
+
+pub fn is_cli_direct_prompt_kind(kind: Option<IvLyricsPromptKind>) -> bool {
+    matches!(
+        kind,
+        Some(
+            IvLyricsPromptKind::Phonetic
+                | IvLyricsPromptKind::CharacterPronunciation
+                | IvLyricsPromptKind::LyricsStudyQuiz
+        )
+    )
 }
 
 pub fn try_detect_lyrics_study_category(prompt: &str) -> Option<String> {
@@ -299,6 +343,26 @@ fn looks_like_phonetic_prompt(prompt: &str) -> bool {
     .unwrap();
     (has_output || original_web.is_match(prompt))
         && (full.is_match(prompt) || simple.is_match(prompt) || original_web.is_match(prompt))
+}
+
+fn looks_like_character_pronunciation_prompt(prompt: &str) -> bool {
+    if prompt.trim().is_empty() {
+        return false;
+    }
+    let lower = prompt.to_ascii_lowercase();
+    let has_aligner_role =
+        lower.contains("multilingual lyrics pronunciation aligner for karaoke sync editing");
+    let has_alignment_task = lower.contains("align that sound back onto the original lyric text")
+        || lower.contains("character-level pronunciation hints")
+        || lower.contains("word-level pronunciation hints");
+    let has_json_contract =
+        lower.contains("return only valid json") || lower.contains("output compact json only");
+    let has_unit_mode = lower.contains("pronunciation unit mode:")
+        || Regex::new(r"(?im)^\s*Pronunciation\s+unit\s+mode\s*:\s*(?:char|word)\s*$")
+            .unwrap()
+            .is_match(prompt);
+
+    has_aligner_role && has_alignment_task && has_json_contract && has_unit_mode
 }
 
 fn extract_lyrics(prompt: &str) -> Option<String> {
@@ -423,6 +487,37 @@ fn normalize_line_count_and_pad(lyrics: &mut String, parsed_line_count: usize) -
         actual += 1;
     }
     line_count
+}
+
+#[allow(dead_code)]
+fn extract_phonetic_target(prompt: &str) -> String {
+    let lower = prompt.to_ascii_lowercase();
+    if lower.contains("english speakers")
+        || lower.contains("use latin alphabet")
+        || lower.contains("romanization")
+        || lower.contains("romanisation")
+    {
+        return "English".to_owned();
+    }
+    if lower.contains("korean speakers")
+        || lower.contains("korean hangul")
+        || lower.contains("hangul pronunciation")
+        || lower.contains("한글")
+        || lower.contains("한국어")
+    {
+        return "Korean (한국어)".to_owned();
+    }
+
+    let for_speakers = Regex::new(
+        r"(?is)\b(?:Convert|Transcribe)\s+these\s+\d+\s+lines\s+of\s+lyrics\b.+?\bfor\s+(?P<target>[^\r\n.]+?)\s+speakers\b",
+    )
+    .unwrap();
+    for_speakers
+        .captures(prompt)
+        .and_then(|c| c.name("target"))
+        .map(|m| clean_inline(m.as_str()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Korean (한국어)".to_owned())
 }
 
 fn split_lines_like_js(value: &str) -> Vec<String> {
@@ -742,7 +837,7 @@ Input lines:\n\
     }
 
     #[test]
-    fn translation_rewrite_pads_line_count_and_strips_number_tags() {
+    fn translation_rewrite_uses_ivlyrics_template_and_pads_line_count() {
         let prompt = "Translate these 3 lines of song lyrics into Korean (한국어)\n\
 INPUT:\n\
 one\n\
@@ -753,9 +848,12 @@ OUTPUT (3 lines in Korean)";
 
         assert_eq!(rewritten.line_count, 3);
         assert!(rewritten.strip_number_tags_from_response);
-        assert!(rewritten.prompt.contains("[1] one"));
-        assert!(rewritten.prompt.contains("[2] two"));
-        assert!(rewritten.prompt.contains("[3]"));
+        assert!(
+            rewritten
+                .prompt
+                .contains("Target language: Korean (한국어).")
+        );
+        assert!(rewritten.prompt.contains("[1] one\n[2] two\n[3]"));
     }
 
     #[test]
@@ -783,8 +881,7 @@ two";
                 .prompt
                 .contains("Target language: Korean (한국어).")
         );
-        assert!(rewritten.prompt.contains("[1] one"));
-        assert!(rewritten.prompt.contains("[2] two"));
+        assert!(rewritten.prompt.contains("[1] one\n[2] two"));
         assert!(!rewritten.prompt.contains("You are a lyrics translator"));
         assert!(
             !rewritten
@@ -810,11 +907,31 @@ RULES:\n\
 INPUT:\n\
 春\n\
 song";
-        let rewritten = try_rewrite_phonetic(prompt).unwrap();
+        let config = PromptConfig::default();
+        let rewritten = try_rewrite_phonetic(prompt, &config).unwrap();
 
         assert_eq!(rewritten.line_count, 2);
         assert_eq!(rewritten.source_lines, vec!["春", "song"]);
         assert!(rewritten.strip_number_tags_from_response);
+        assert_eq!(rewritten.prompt, prompt);
+        assert!(
+            rewritten
+                .prompt
+                .contains("Return only the pronunciation lines")
+        );
+    }
+
+    #[test]
+    fn detects_character_pronunciation_prompt() {
+        let prompt = "You are a multilingual lyrics pronunciation aligner for karaoke sync editing.\n\
+Align that sound back onto the original lyric text.\n\
+Return only valid JSON.\n\
+Pronunciation unit mode: char";
+
+        assert_eq!(
+            try_detect_kind(prompt),
+            Some(IvLyricsPromptKind::CharacterPronunciation)
+        );
     }
 
     #[test]

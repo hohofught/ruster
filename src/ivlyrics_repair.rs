@@ -34,7 +34,7 @@ where
     }
 
     match rewrite.kind {
-        IvLyricsPromptKind::Phonetic => {
+        IvLyricsPromptKind::Phonetic | IvLyricsPromptKind::CharacterPronunciation => {
             repair_phonetic(
                 label,
                 request_id,

@@ -464,6 +464,7 @@ impl TranslatorHost {
         self.forward_to_backend(text, timeout, None).await
     }
 
+    #[allow(dead_code)]
     pub async fn translate_with_model(
         &self,
         text: &str,
@@ -535,18 +536,34 @@ impl TranslatorHost {
         Ok(result?)
     }
 
+    #[allow(dead_code)]
     pub async fn send_ivlyrics_study_prompt_with_webview_limit_fallback(
         &self,
         prompt: &str,
         timeout: Duration,
     ) -> Result<String, HostError> {
+        self.send_ivlyrics_direct_prompt_with_webview_limit_fallback(
+            prompt,
+            timeout,
+            ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz,
+        )
+        .await
+    }
+
+    pub async fn send_ivlyrics_direct_prompt_with_webview_limit_fallback(
+        &self,
+        prompt: &str,
+        timeout: Duration,
+        kind: ivlyrics::IvLyricsPromptKind,
+    ) -> Result<String, HostError> {
         self.request_guard.throw_if_active()?;
 
         let settings = self.settings.read().clone();
         let mode = self.mode();
+        let route_label = ivlyrics_direct_route_label(kind);
         if let Some((remaining, reason)) = self.ivlyrics_limit_guard.try_get_fallback_cooldown() {
             self.logs.push(format!(
-                "[Host] ivLyrics study CLI cooldown 중 - WebView fallback 직접 사용 ({:.0}s 남음, reason={})",
+                "[Host] {route_label} CLI cooldown 중 - WebView fallback 직접 사용 ({:.0}s 남음, reason={})",
                 remaining.as_secs_f32(),
                 summarize_text(&reason, 160)
             ));
@@ -576,7 +593,7 @@ impl TranslatorHost {
         .with_working_dir(ivlyrics_study_cli_working_dir());
 
         self.logs.push(format!(
-            "[Host] ivLyrics study fast lane -> Gemini CLI raw 직접 호출 (mode={}, timeout={}s, gates=off, cooldown=guarded, wrapperRetry=off, nativeFallback=off, WebViewFallback=limit)",
+            "[Host] {route_label} fast lane -> Gemini CLI raw 직접 호출 (mode={}, timeout={}s, gates=off, cooldown=guarded, wrapperRetry=off, nativeFallback=off, WebViewFallback=limit)",
             mode.label(),
             timeout_seconds
         ));
@@ -585,7 +602,7 @@ impl TranslatorHost {
             Ok(text) => {
                 self.ivlyrics_limit_guard.record_success();
                 self.logs.push(format!(
-                    "[Host] ivLyrics study CLI 응답 수신 (len={})",
+                    "[Host] {route_label} CLI 응답 수신 (len={})",
                     text.len()
                 ));
                 Ok(text)
@@ -595,13 +612,13 @@ impl TranslatorHost {
                     .record_rate_limit(&error.message, &self.logs);
                 if mode == TranslationMode::GeminiCli {
                     self.logs.push(format!(
-                        "[Host] ivLyrics study CLI limit 감지 - 현재 Gemini CLI 모드라 WebView fallback 생략 ({})",
+                        "[Host] {route_label} CLI limit 감지 - 현재 Gemini CLI 모드라 WebView fallback 생략 ({})",
                         describe_error(&error)
                     ));
                     Err(error.into())
                 } else {
                     self.logs.push(format!(
-                        "[Host] ivLyrics study CLI limit 감지 - WebView fallback 시작 ({})",
+                        "[Host] {route_label} CLI limit 감지 - WebView fallback 시작 ({})",
                         describe_error(&error)
                     ));
                     self.send_ivlyrics_study_prompt_via_serial_webview_fallback(
@@ -612,7 +629,7 @@ impl TranslatorHost {
             }
             Err(error) => {
                 self.logs.push(format!(
-                    "[Host] ivLyrics study CLI 오류: {}",
+                    "[Host] {route_label} CLI 오류: {}",
                     describe_error(&error)
                 ));
                 Err(error.into())
@@ -932,6 +949,15 @@ fn ivlyrics_study_max_output_tokens(prompt: &str) -> Option<u32> {
     }
 }
 
+fn ivlyrics_direct_route_label(kind: ivlyrics::IvLyricsPromptKind) -> &'static str {
+    match kind {
+        ivlyrics::IvLyricsPromptKind::Phonetic => "ivLyrics pronunciation",
+        ivlyrics::IvLyricsPromptKind::CharacterPronunciation => "ivLyrics character pronunciation",
+        ivlyrics::IvLyricsPromptKind::LyricsStudyQuiz => "ivLyrics study",
+        ivlyrics::IvLyricsPromptKind::Translation => "ivLyrics translation",
+    }
+}
+
 fn ivlyrics_study_cli_working_dir() -> PathBuf {
     std::env::temp_dir()
         .join("ruster")
@@ -941,7 +967,8 @@ fn ivlyrics_study_cli_working_dir() -> PathBuf {
 fn ivlyrics_raw_max_output_tokens(prompt: &str) -> Option<u32> {
     match ivlyrics::try_detect_kind(prompt) {
         Some(ivlyrics::IvLyricsPromptKind::Translation)
-        | Some(ivlyrics::IvLyricsPromptKind::Phonetic) => Some(16384),
+        | Some(ivlyrics::IvLyricsPromptKind::Phonetic)
+        | Some(ivlyrics::IvLyricsPromptKind::CharacterPronunciation) => Some(16384),
         _ => Some(8192),
     }
 }

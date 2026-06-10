@@ -85,7 +85,9 @@ impl IvLyricsGate {
                 .await;
                 IvLyricsGateRequest::empty()
             }
-            IvLyricsPromptKind::LyricsStudyQuiz => IvLyricsGateRequest::empty(),
+            IvLyricsPromptKind::CharacterPronunciation | IvLyricsPromptKind::LyricsStudyQuiz => {
+                IvLyricsGateRequest::empty()
+            }
         }
     }
 

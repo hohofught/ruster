@@ -823,7 +823,20 @@ fn resize_controller_to_window(hwnd: HWND, controller: &ICoreWebView2Controller)
     let mut rect = RECT::default();
     unsafe {
         let _ = GetClientRect(hwnd, &mut rect);
-        let _ = controller.SetBounds(rect);
+    }
+    if rect.right <= rect.left || rect.bottom <= rect.top {
+        return;
+    }
+    rect.left = 0;
+    rect.top = 0;
+    let _ = unsafe { controller.SetBounds(rect) };
+}
+
+fn resize_attached_controller(hwnd: HWND) {
+    if let Some(state) = unsafe { window_state_mut(hwnd) }
+        && let Some(controller) = state.controller.as_ref()
+    {
+        resize_controller_to_window(hwnd, controller);
     }
 }
 
@@ -855,6 +868,7 @@ fn apply_visible_state(hwnd: HWND) {
         let _ = ShowWindow(hwnd, SW_RESTORE);
         let _ = SetForegroundWindow(hwnd);
     }
+    resize_attached_controller(hwnd);
 }
 
 fn apply_offscreen_background_state(hwnd: HWND, remember_bounds: bool) {
@@ -867,6 +881,7 @@ fn apply_offscreen_background_state(hwnd: HWND, remember_bounds: bool) {
     }
     set_taskbar_and_alpha(hwnd, false, 3);
     move_window_offscreen(hwnd, false);
+    resize_attached_controller(hwnd);
 }
 
 fn apply_pseudo_minimize_from_user(hwnd: HWND) {
@@ -877,6 +892,7 @@ fn apply_pseudo_minimize_from_user(hwnd: HWND) {
     }
     set_taskbar_and_alpha(hwnd, true, 3);
     move_window_offscreen(hwnd, true);
+    resize_attached_controller(hwnd);
 }
 
 fn restore_from_pseudo_minimize(hwnd: HWND) {
@@ -945,6 +961,7 @@ fn set_window_rect(hwnd: HWND, rect: RECT, flags: SET_WINDOW_POS_FLAGS) {
     unsafe {
         let _ = SetWindowPos(hwnd, None, rect.left, rect.top, width, height, flags);
     }
+    resize_attached_controller(hwnd);
 }
 
 fn window_size_for_client_size(client_width: i32, client_height: i32) -> (i32, i32) {

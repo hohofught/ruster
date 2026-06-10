@@ -1,5 +1,6 @@
 mod app_icon;
 mod app_paths;
+mod auto_prompt;
 mod cli;
 mod cli_discovery;
 mod cli_setup;
@@ -12,6 +13,7 @@ mod gemini_gate;
 mod gui;
 mod host;
 mod http_server;
+mod i18n;
 mod ivlyrics;
 mod ivlyrics_gate;
 mod ivlyrics_repair;

@@ -1814,7 +1814,9 @@ const REQUEST_GUARD_BOOTSTRAP_JS: &str = r#"
   };
 
   document.addEventListener("keydown", (event) => {
-    if (event.key === "F12" || event.code === "F12" || event.keyCode === 123) {
+    const isF12 = event.key === "F12" || event.code === "F12" || event.keyCode === 123;
+    const isF5 = event.key === "F5" || event.code === "F5" || event.keyCode === 116;
+    if (isF12 || isF5) {
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
@@ -1825,7 +1827,7 @@ const REQUEST_GUARD_BOOTSTRAP_JS: &str = r#"
   if (state.fetch) {
     window.fetch = function(resource, init) {
       if (isGuarded()) {
-        return Promise.reject(new DOMException("Blocked by F12 request guard", "AbortError"));
+        return Promise.reject(new DOMException("Blocked by request guard", "AbortError"));
       }
       const controller = new AbortController();
       const nextInit = init ? Object.assign({}, init) : {};
