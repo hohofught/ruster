@@ -43,4 +43,6 @@ windows = { version = "0.61.3", features = [
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-panic = "abort"
+# unwind: 패닉이 나도 tokio가 spawn 태스크 단위로 잡아 런타임이 생존한다.
+# (C#의 미관측 Task 예외 격리와 동급. 락은 전부 parking_lot/tokio라 poison 캐스케이드 없음.)
+panic = "unwind"

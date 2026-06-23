@@ -47,12 +47,41 @@ use crate::settings::AppSettings;
 type ShutdownSignal = Arc<Mutex<Option<oneshot::Sender<()>>>>;
 const DETACHED_TRAY_ARGUMENT: &str = "--detached-tray-child";
 
+/// 전역 안전망: 어느 스레드/태스크에서든 패닉이 나면 abort 직전에 위치·메시지를 로그로 남긴다.
+/// (`panic = "abort"`라 복구는 못 하지만, 무로그 종료를 막아 진단 가능성을 확보한다.
+///  C# 쪽 `AppDomain.UnhandledException` + WinForms/WPF unhandled 핸들러의 등가물.)
+fn install_panic_hook(logs: LogBuffer) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_owned());
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_owned());
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_owned();
+        logs.push(format!(
+            "[Fatal] 패닉 (thread={thread}, at={location}): {message}"
+        ));
+        eprintln!("[Fatal] panic (thread={thread}, at={location}): {message}");
+        default_hook(info);
+    }));
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    let logs = LogBuffer::new();
+    install_panic_hook(logs.clone());
     let paths = AppPaths::resolve();
     let settings = AppSettings::load(&paths);
-    let logs = LogBuffer::new();
     let detached_tray_child = args
         .iter()
         .any(|arg| arg.eq_ignore_ascii_case(DETACHED_TRAY_ARGUMENT));

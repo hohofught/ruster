@@ -16,7 +16,10 @@ pub struct AppSettings {
     pub open_ai_proxy_enabled: bool,
     pub gemini_proxy_enabled: bool,
     pub require_proxy_api_key: bool,
+    /// 대표(첫 번째) 로컬 API 키. 하위 호환용.
     pub local_api_key: String,
+    /// 로컬 프록시에서 검증할 API 키 목록 (다중 발급). 전부 유효하며 첫 항목이 대표 키.
+    pub local_api_keys: Vec<String>,
     pub raw_prompt_mode: bool,
     pub mort_cli_raw_mode: bool,
     pub gemini_cli_model: String,
@@ -62,8 +65,9 @@ impl Default for AppSettings {
             gemini_proxy_enabled: true,
             require_proxy_api_key: true,
             local_api_key: generate_local_api_key(),
+            local_api_keys: Vec::new(),
             raw_prompt_mode: false,
-            mort_cli_raw_mode: true,
+            mort_cli_raw_mode: false,
             gemini_cli_model: model_catalog::DEFAULT_CLI_MODEL_ID.to_owned(),
             gemini_cli_timeout_seconds: 120,
             gemini_cli_verified_model_ids: Vec::new(),
@@ -132,7 +136,53 @@ impl AppSettings {
     }
 
     pub fn proxy_api_key_required(&self) -> bool {
-        self.require_proxy_api_key && !normalize_local_api_key(&self.local_api_key).is_empty()
+        self.require_proxy_api_key && self.has_any_local_api_key()
+    }
+
+    /// 현재 유효한 로컬 API 키 목록(정규화). 비어 있으면 대표 키로 폴백.
+    pub fn local_api_key_list(&self) -> Vec<String> {
+        let list = normalize_local_api_key_list(&self.local_api_keys);
+        if !list.is_empty() {
+            return list;
+        }
+        let legacy = normalize_local_api_key(&self.local_api_key);
+        if legacy.is_empty() {
+            Vec::new()
+        } else {
+            vec![legacy]
+        }
+    }
+
+    /// 발급된 로컬 API 키가 하나라도 있는지 여부.
+    pub fn has_any_local_api_key(&self) -> bool {
+        !self.local_api_key_list().is_empty()
+    }
+
+    /// 후보 키가 풀의 어떤 키와도 일치하는지 고정시간 비교로 검증.
+    pub fn matches_any_local_api_key(&self, candidate: &str) -> bool {
+        let normalized = normalize_local_api_key(candidate);
+        if normalized.is_empty() {
+            return false;
+        }
+        let mut matched = false;
+        for key in self.local_api_key_list() {
+            // 타이밍 누수를 줄이기 위해 일치해도 끝까지 순회
+            if fixed_time_eq(normalized.as_bytes(), key.as_bytes()) {
+                matched = true;
+            }
+        }
+        matched
+    }
+
+    /// API 키 풀을 통째로 교체. 비면 새 키를 하나 생성해 최소 1개를 보장.
+    /// 첫 항목을 대표 키(`local_api_key`)로 동기화한다.
+    pub fn set_local_api_keys(&mut self, keys: impl IntoIterator<Item = impl AsRef<str>>) {
+        let mut normalized = normalize_local_api_key_list(keys);
+        if normalized.is_empty() {
+            normalized.push(generate_local_api_key());
+        }
+        self.local_api_key = normalized[0].clone();
+        self.local_api_keys = normalized;
     }
 
     pub fn has_gemini_cli_verification_cache(&self) -> bool {
@@ -206,10 +256,19 @@ impl AppSettings {
         self.web_view_idle_refresh_seconds = self.web_view_idle_refresh_seconds.clamp(10, 600);
         self.theme_mode = normalize_theme_mode(&self.theme_mode);
         self.ui_language = normalize_ui_language(&self.ui_language);
-        self.local_api_key = normalize_local_api_key(&self.local_api_key);
-        if self.local_api_key.is_empty() {
-            self.local_api_key = generate_local_api_key();
+        let mut keys = normalize_local_api_key_list(&self.local_api_keys);
+        if keys.is_empty() {
+            // 레거시 단일 키에서 마이그레이션
+            let legacy = normalize_local_api_key(&self.local_api_key);
+            if !legacy.is_empty() {
+                keys.push(legacy);
+            }
         }
+        if keys.is_empty() {
+            keys.push(generate_local_api_key());
+        }
+        self.local_api_key = keys[0].clone();
+        self.local_api_keys = keys;
         self.last_translation_mode = normalize_translation_mode(&self.last_translation_mode);
         if self.start_with_windows {
             self.run_in_tray = true;
@@ -264,6 +323,33 @@ pub fn normalize_local_api_key(api_key: &str) -> String {
     api_key.trim().to_owned()
 }
 
+/// 키 목록을 정규화(트림 + 빈 값 제거 + 중복 제거, 입력 순서 유지).
+pub fn normalize_local_api_key_list(keys: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
+    let mut result: Vec<String> = Vec::new();
+    for raw in keys {
+        let key = normalize_local_api_key(raw.as_ref());
+        if key.is_empty() {
+            continue;
+        }
+        if !result.iter().any(|existing| existing == &key) {
+            result.push(key);
+        }
+    }
+    result
+}
+
+/// 길이까지 포함해 고정시간(상수시간)으로 바이트 비교.
+fn fixed_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (left, right) in a.iter().zip(b.iter()) {
+        diff |= left ^ right;
+    }
+    diff == 0
+}
+
 pub fn normalize_theme_mode(theme_mode: &str) -> String {
     match theme_mode.trim().to_ascii_lowercase().as_str() {
         "light" => "Light",
@@ -288,7 +374,8 @@ pub fn normalize_translation_mode(mode: &str) -> String {
 }
 
 pub fn clamp_web_view_instance_count(value: u32) -> u32 {
-    value.clamp(1, 5)
+    // provider(Gemini/ChatGPT)당 최대 3개. 두 provider 합산 시 최대 6개.
+    value.clamp(1, 3)
 }
 
 pub fn generate_local_api_key() -> String {
@@ -426,14 +513,75 @@ mod tests {
     }
 
     #[test]
-    fn mort_cli_raw_mode_defaults_on_and_uses_pascal_case_contract() {
+    fn mort_cli_raw_mode_defaults_off_and_uses_pascal_case_contract() {
         let settings: AppSettings = serde_json::from_str(r#"{}"#).unwrap();
-        assert!(settings.mort_cli_raw_mode);
-
-        let settings: AppSettings = serde_json::from_str(r#"{"MortCliRawMode":false}"#).unwrap();
         assert!(!settings.mort_cli_raw_mode);
+
+        let settings: AppSettings = serde_json::from_str(r#"{"MortCliRawMode":true}"#).unwrap();
+        assert!(settings.mort_cli_raw_mode);
         let json = serde_json::to_string(&settings).unwrap();
-        assert!(json.contains(r#""MortCliRawMode":false"#));
+        assert!(json.contains(r#""MortCliRawMode":true"#));
+    }
+
+    #[test]
+    fn local_api_keys_migrate_legacy_single_key_on_normalize() {
+        let settings: AppSettings =
+            serde_json::from_str(r#"{"LocalApiKey":"rst-legacy"}"#).unwrap();
+        let settings = settings.normalized();
+
+        assert_eq!(settings.local_api_keys, vec!["rst-legacy".to_owned()]);
+        assert_eq!(settings.local_api_key, "rst-legacy");
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""LocalApiKeys":["rst-legacy"]"#));
+    }
+
+    #[test]
+    fn local_api_keys_round_trip_through_pascal_case_contract() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{"LocalApiKeys":["  rst-a  ","rst-b","rst-a",""]}"#,
+        )
+        .unwrap();
+        let settings = settings.normalized();
+
+        assert_eq!(
+            settings.local_api_keys,
+            vec!["rst-a".to_owned(), "rst-b".to_owned()]
+        );
+        assert_eq!(settings.local_api_key, "rst-a");
+    }
+
+    #[test]
+    fn set_local_api_keys_dedups_and_keeps_first_as_representative() {
+        let mut settings = AppSettings::default();
+        settings.set_local_api_keys(["rst-1", "rst-2", "rst-1", "  "]);
+
+        assert_eq!(
+            settings.local_api_keys,
+            vec!["rst-1".to_owned(), "rst-2".to_owned()]
+        );
+        assert_eq!(settings.local_api_key, "rst-1");
+
+        settings.set_local_api_keys(Vec::<String>::new());
+        assert_eq!(settings.local_api_keys.len(), 1);
+        assert!(!settings.local_api_keys[0].is_empty());
+    }
+
+    #[test]
+    fn matches_any_local_api_key_validates_against_full_pool() {
+        let mut settings = AppSettings::default();
+        settings.set_local_api_keys(["rst-1", "rst-2"]);
+
+        assert!(settings.matches_any_local_api_key("rst-1"));
+        assert!(settings.matches_any_local_api_key("  rst-2  "));
+        assert!(!settings.matches_any_local_api_key("rst-3"));
+        assert!(!settings.matches_any_local_api_key(""));
+    }
+
+    #[test]
+    fn clamp_web_view_instance_count_caps_at_three_per_provider() {
+        assert_eq!(clamp_web_view_instance_count(0), 1);
+        assert_eq!(clamp_web_view_instance_count(3), 3);
+        assert_eq!(clamp_web_view_instance_count(5), 3);
     }
 
     #[test]

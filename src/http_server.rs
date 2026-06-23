@@ -28,7 +28,7 @@ use crate::logging::{LogBuffer, summarize_text};
 use crate::model_catalog;
 use crate::prompt_config::PromptConfig;
 use crate::proxy_dedup::ProxyDeduplicator;
-use crate::settings::{AppSettings, normalize_local_api_key};
+use crate::settings::AppSettings;
 use crate::usage_metrics::UsageMetrics;
 
 const MAX_REQUEST_BODY_BYTES: usize = 1_000_000;
@@ -486,13 +486,9 @@ fn validate_api_key(
     if !settings.proxy_api_key_required() {
         return true;
     }
-    let expected = normalize_local_api_key(&settings.local_api_key);
     candidates(headers, query)
         .into_iter()
-        .map(|value| normalize_local_api_key(&value))
-        .any(|candidate| {
-            !candidate.is_empty() && constant_time_eq(candidate.as_bytes(), expected.as_bytes())
-        })
+        .any(|candidate| settings.matches_any_local_api_key(&candidate))
 }
 
 fn candidates(headers: &HeaderMap, query: &HashMap<String, Vec<String>>) -> Vec<String> {
@@ -534,17 +530,6 @@ fn push_candidate(out: &mut Vec<String>, value: &str) {
     if !value.is_empty() {
         out.push(value.to_owned());
     }
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (left, right) in a.iter().zip(b.iter()) {
-        diff |= left ^ right;
-    }
-    diff == 0
 }
 
 fn header_to_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -1816,7 +1801,8 @@ async fn handle_mort(
     };
     let settings_snapshot = state.settings.read().clone();
     let host_raw_mode = state.host.raw_prompt_mode();
-    let use_mort_cli_raw = settings_snapshot.mort_cli_raw_mode;
+    let use_mort_cli_raw =
+        settings_snapshot.mort_cli_raw_mode && state.host.mode() == TranslationMode::GeminiCli;
     let prompt = custom_api::build_prompt(
         &incoming.text,
         preset.as_ref(),

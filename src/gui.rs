@@ -325,6 +325,10 @@ struct RusterApp {
     last_cli_setup_phase: String,
     cli_model_verified_notice: Option<String>,
     cli_start_after_setup: bool,
+    webview_profile_reset_inflight: Arc<AtomicBool>,
+    webview_profile_reset_status: Arc<RwLock<Option<String>>>,
+    confirm_webview_profile_reset: bool,
+    show_mort_preset_guide: bool,
     update_check_inflight: Arc<AtomicBool>,
     update_download_inflight: Arc<AtomicBool>,
     update_check_panel: Arc<RwLock<UpdateCheckPanelState>>,
@@ -339,6 +343,7 @@ struct RusterApp {
     close_requested: bool,
     native_hwnd: Option<isize>,
     last_mica_dark: Option<bool>,
+    selected_local_api_key: Option<String>,
 }
 
 impl RusterApp {
@@ -389,6 +394,10 @@ impl RusterApp {
             last_cli_setup_phase: String::new(),
             cli_model_verified_notice: None,
             cli_start_after_setup: false,
+            webview_profile_reset_inflight: Arc::new(AtomicBool::new(false)),
+            webview_profile_reset_status: Arc::new(RwLock::new(None)),
+            confirm_webview_profile_reset: false,
+            show_mort_preset_guide: false,
             update_check_inflight: Arc::new(AtomicBool::new(false)),
             update_download_inflight: Arc::new(AtomicBool::new(false)),
             update_check_panel: Arc::new(RwLock::new(UpdateCheckPanelState::for_language(
@@ -405,6 +414,7 @@ impl RusterApp {
             close_requested: false,
             native_hwnd,
             last_mica_dark: None,
+            selected_local_api_key: None,
         }
     }
 
@@ -620,6 +630,41 @@ impl RusterApp {
             );
         });
         self.set_status(cli_environment_check_started(language));
+    }
+
+    fn sync_webview_profile_reset_status(&mut self) {
+        let status = self.webview_profile_reset_status.write().take();
+        if let Some(status) = status {
+            self.set_status(status);
+        }
+    }
+
+    fn launch_webview_profile_reset(&mut self) {
+        let language = self.language();
+        if self
+            .webview_profile_reset_inflight
+            .swap(true, Ordering::SeqCst)
+        {
+            self.set_status(webview_profile_reset_busy_status(language));
+            return;
+        }
+
+        let host = self.host.clone();
+        let inflight = self.webview_profile_reset_inflight.clone();
+        let status_slot = self.webview_profile_reset_status.clone();
+        self.set_status(webview_profile_resetting_status(language));
+        self.runtime.spawn(async move {
+            let status = match host.reset_webview_profiles().await {
+                Ok(result) => webview_profile_reset_result_status(
+                    language,
+                    result.deleted_existing_data,
+                    &result.webview_data_dir.display().to_string(),
+                ),
+                Err(error) => webview_profile_reset_error_status(language, &error.to_string()),
+            };
+            *status_slot.write() = Some(status);
+            inflight.store(false, Ordering::SeqCst);
+        });
     }
 
     fn reload_prompt_editor(&mut self) {
@@ -1112,27 +1157,10 @@ impl RusterApp {
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             compact_card_frame(badge_bg(), border()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(RichText::new(&self.status_message).color(muted_text()));
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    let checking = self.update_check_inflight.load(Ordering::SeqCst);
-                    if ui
-                        .add_enabled(
-                            !checking,
-                            egui::Button::new(if checking {
-                                checking_label(language)
-                            } else {
-                                update_check_button(language)
-                            }),
-                        )
-                        .clicked()
-                    {
-                        self.launch_update_check();
-                    }
-                    if ui.button(developer_info_button(language)).clicked() {
-                        self.show_developer_info = true;
-                    }
-                });
+                ui.add(
+                    egui::Label::new(RichText::new(&self.status_message).color(muted_text()))
+                        .wrap(),
+                );
             });
         });
     }
@@ -1152,26 +1180,6 @@ impl RusterApp {
             });
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mut language_changed = false;
-                let selected_language = self.language();
-                egui::ComboBox::from_id_salt("language_combo")
-                    .width(118.0)
-                    .selected_text(selected_language.display_name())
-                    .show_ui(ui, |ui| {
-                        for option in UiLanguage::ALL {
-                            language_changed |= ui
-                                .selectable_value(
-                                    &mut self.draft.ui_language,
-                                    option.setting_value().to_owned(),
-                                    option.display_name(),
-                                )
-                                .changed();
-                        }
-                    });
-                ui.label(RichText::new(language_label(language)).color(muted_text()));
-
-                ui.add_space(10.0);
-
                 let mut theme_changed = false;
                 let selected_theme = normalize_theme_mode(&self.draft.theme_mode);
                 egui::ComboBox::from_id_salt("theme_combo")
@@ -1189,17 +1197,6 @@ impl RusterApp {
                         }
                     });
                 ui.label(RichText::new(theme_label(language)).color(muted_text()));
-
-                if language_changed {
-                    self.draft.ui_language = normalize_ui_language(&self.draft.ui_language);
-                    let updated_language = self.language();
-                    self.cli_setup_panel.write().reset_if_idle(updated_language);
-                    self.update_check_panel
-                        .write()
-                        .reset_if_idle(updated_language);
-                    self.save_settings();
-                    self.set_status(language_saved_status(updated_language));
-                }
 
                 if theme_changed {
                     self.draft.theme_mode = normalize_theme_mode(&self.draft.theme_mode);
@@ -1241,8 +1238,8 @@ impl RusterApp {
             }
             if mode_start_card(
                 &mut columns[1],
-                "Gemini CLI",
-                cli_warranty_caption(language),
+                "Antigravity CLI",
+                antigravity_priority_caption(language),
                 "CLI",
                 success(),
                 language,
@@ -1312,11 +1309,6 @@ impl RusterApp {
                     &mut self.draft.maximum_usage_mode_enabled,
                     maximum_usage_label(language),
                 );
-                toggle_row(
-                    ui,
-                    &mut self.draft.web_view_parallel_processing_enabled,
-                    webview_parallel_label(language),
-                );
                 ui.add_space(18.0);
                 egui::Grid::new("webview_runtime_grid")
                     .num_columns(3)
@@ -1346,12 +1338,42 @@ impl RusterApp {
                         ui.add_sized(
                             [90.0, 32.0],
                             egui::DragValue::new(&mut self.draft.web_view_instance_count)
-                                .range(1..=5)
+                                .range(1..=3)
                                 .speed(1),
                         );
-                        ui.label(RichText::new(instances_unit_label(language)).color(muted_text()));
+                        ui.label(
+                            RichText::new(webview_instance_count_hint(language))
+                                .size(12.0)
+                                .color(muted_text()),
+                        );
                         ui.end_row();
                     });
+
+                ui.add_space(14.0);
+                let reset_busy = self.webview_profile_reset_inflight.load(Ordering::SeqCst);
+                if ui
+                    .add_enabled(
+                        !reset_busy,
+                        egui::Button::new(if reset_busy {
+                            webview_profile_resetting_button(language)
+                        } else {
+                            reset_webview_profile_button(language)
+                        }),
+                    )
+                    .clicked()
+                {
+                    self.confirm_webview_profile_reset = true;
+                }
+                ui.add_space(8.0);
+                if ui
+                    .add_sized(
+                        [190.0, 32.0],
+                        egui::Button::new(mort_preset_guide_button(language)),
+                    )
+                    .clicked()
+                {
+                    self.show_mort_preset_guide = true;
+                }
 
                 let ui = &mut columns[1];
                 ui.add_space(4.0);
@@ -1470,33 +1492,186 @@ impl RusterApp {
             );
 
             ui.add_space(12.0);
-            egui::Grid::new("api_key_grid")
-                .num_columns(2)
-                .spacing([14.0, 10.0])
-                .show(ui, |ui| {
+            self.draw_local_api_keys(ui, language);
+        });
+    }
+
+    fn draw_local_api_keys(&mut self, ui: &mut egui::Ui, language: UiLanguage) {
+        self.sync_local_api_key_selection();
+        let keys = self.draft.local_api_keys.clone();
+
+        enum KeyAction {
+            None,
+            Select(String),
+            Add,
+            Delete,
+            CopySelected,
+            CopyAll,
+        }
+        let mut action = KeyAction::None;
+
+        egui::Grid::new("api_key_grid")
+            .num_columns(2)
+            .spacing([14.0, 10.0])
+            .show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.set_min_width(150.0);
                     ui.label(local_api_key_label(language));
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.draft.local_api_key)
-                                .desired_width((ui.available_width() - 156.0).max(160.0)),
-                        );
-                        if ui.button(generate_button(language)).clicked() {
-                            self.draft.local_api_key = generate_local_api_key();
-                            self.draft.require_proxy_api_key = true;
-                            ui.ctx()
-                                .copy_text(self.draft.local_api_key.trim().to_owned());
-                            self.set_status(local_api_key_generated_status(language));
+                    ui.label(
+                        RichText::new(local_api_key_all_valid_label(language))
+                            .size(12.0)
+                            .color(muted_text()),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    let button_width = 100.0;
+                    let list_width = (ui.available_width() - button_width - 12.0).max(240.0);
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_min_size(egui::vec2(list_width, 108.0));
+                        egui::ScrollArea::both()
+                            .id_salt("local_api_key_list")
+                            .max_height(108.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_min_width(list_width - 18.0);
+                                for key in &keys {
+                                    let selected = self.selected_local_api_key.as_deref()
+                                        == Some(key.as_str());
+                                    if ui.selectable_label(selected, key.as_str()).clicked() {
+                                        action = KeyAction::Select(key.clone());
+                                    }
+                                }
+                            });
+                    });
+                    ui.add_space(12.0);
+                    ui.vertical(|ui| {
+                        if ui
+                            .add_sized(
+                                [button_width, 32.0],
+                                egui::Button::new(add_key_button(language)),
+                            )
+                            .clicked()
+                        {
+                            action = KeyAction::Add;
                         }
-                        if ui.button(copy_button(language)).clicked() {
-                            ui.ctx()
-                                .copy_text(self.draft.local_api_key.trim().to_owned());
-                            self.logs.push("[GUI] 로컬 API 키를 복사했습니다.");
-                            self.set_status(local_api_key_copied_status(language));
+                        let can_delete =
+                            self.selected_local_api_key.is_some() && keys.len() > 1;
+                        if ui
+                            .add_enabled_ui(can_delete, |ui| {
+                                ui.add_sized(
+                                    [button_width, 32.0],
+                                    egui::Button::new(delete_key_button(language)),
+                                )
+                            })
+                            .inner
+                            .clicked()
+                        {
+                            action = KeyAction::Delete;
+                        }
+                        let can_copy = self.selected_local_api_key.is_some();
+                        if ui
+                            .add_enabled_ui(can_copy, |ui| {
+                                ui.add_sized(
+                                    [button_width, 32.0],
+                                    egui::Button::new(copy_selected_button(language)),
+                                )
+                            })
+                            .inner
+                            .clicked()
+                        {
+                            action = KeyAction::CopySelected;
+                        }
+                        if ui
+                            .add_sized(
+                                [button_width, 32.0],
+                                egui::Button::new(copy_all_button(language)),
+                            )
+                            .clicked()
+                        {
+                            action = KeyAction::CopyAll;
                         }
                     });
-                    ui.end_row();
                 });
-        });
+                ui.end_row();
+            });
+
+        match action {
+            KeyAction::None => {}
+            KeyAction::Select(key) => self.selected_local_api_key = Some(key),
+            KeyAction::Add => self.add_local_api_key(language),
+            KeyAction::Delete => self.delete_selected_local_api_key(language),
+            KeyAction::CopySelected => {
+                self.copy_selected_local_api_key(ui.ctx().clone(), language)
+            }
+            KeyAction::CopyAll => self.copy_all_local_api_keys(ui.ctx().clone(), language),
+        }
+    }
+
+    /// draft 키 풀에 최소 1개를 보장하고, 선택 항목이 유효하지 않으면 첫 키로 맞춘다.
+    fn sync_local_api_key_selection(&mut self) {
+        if self.draft.local_api_keys.is_empty() {
+            let keys = self.draft.local_api_key_list();
+            self.draft.set_local_api_keys(keys);
+        }
+        let valid = self
+            .selected_local_api_key
+            .as_ref()
+            .map(|sel| self.draft.local_api_keys.iter().any(|key| key == sel))
+            .unwrap_or(false);
+        if !valid {
+            self.selected_local_api_key = self.draft.local_api_keys.first().cloned();
+        }
+    }
+
+    fn add_local_api_key(&mut self, language: UiLanguage) {
+        let new_key = generate_local_api_key();
+        let mut keys = self.draft.local_api_keys.clone();
+        keys.push(new_key.clone());
+        self.draft.set_local_api_keys(keys);
+        self.selected_local_api_key = Some(new_key);
+        self.save_settings();
+        self.set_status(local_api_key_added_status(language));
+    }
+
+    fn delete_selected_local_api_key(&mut self, language: UiLanguage) {
+        let Some(selected) = self.selected_local_api_key.clone() else {
+            return;
+        };
+        if self.draft.local_api_keys.len() <= 1 {
+            return;
+        }
+        let Some(index) = self
+            .draft
+            .local_api_keys
+            .iter()
+            .position(|key| key == &selected)
+        else {
+            return;
+        };
+        let mut keys = self.draft.local_api_keys.clone();
+        keys.remove(index);
+        let next = keys[index.min(keys.len() - 1)].clone();
+        self.draft.set_local_api_keys(keys);
+        self.selected_local_api_key = Some(next);
+        self.save_settings();
+        self.set_status(local_api_key_deleted_status(language));
+    }
+
+    fn copy_selected_local_api_key(&mut self, ctx: egui::Context, language: UiLanguage) {
+        let Some(selected) = self.selected_local_api_key.clone() else {
+            return;
+        };
+        ctx.copy_text(selected.trim().to_owned());
+        self.logs.push("[GUI] 선택한 로컬 API 키를 복사했습니다.");
+        self.set_status(local_api_key_selected_copied_status(language));
+    }
+
+    fn copy_all_local_api_keys(&mut self, ctx: egui::Context, language: UiLanguage) {
+        let keys = self.draft.local_api_keys.clone();
+        ctx.copy_text(keys.join("\n"));
+        self.logs
+            .push(format!("[GUI] 로컬 API 키 {}개를 복사했습니다.", keys.len()));
+        self.set_status(local_api_key_all_copied_status(language, keys.len()));
     }
 
     fn draw_stats_section(&mut self, ui: &mut egui::Ui) {
@@ -1581,16 +1756,6 @@ impl RusterApp {
             ui.add_space(8.0);
             toggle_row(
                 ui,
-                &mut self.draft.iv_lyrics_phonetic_use_cli_wrapper_enabled,
-                ivlyrics_phonetic_cli_label(language),
-            );
-            ui.horizontal(|ui| {
-                ui.add_space(22.0);
-                ui.label(RichText::new(ivlyrics_phonetic_cli_detail(language)).color(muted_text()));
-            });
-            ui.add_space(8.0);
-            toggle_row(
-                ui,
                 &mut self.draft.iv_lyrics_auto_prompt_selection_enabled,
                 ivlyrics_auto_prompt_label(language),
             );
@@ -1598,78 +1763,124 @@ impl RusterApp {
                 ui.add_space(22.0);
                 ui.label(RichText::new(ivlyrics_auto_prompt_detail(language)).color(muted_text()));
             });
-        });
-
-        ui.add_space(14.0);
-        draw_card(ui, prompt_editor_title(language), |ui| {
+            ui.add_space(8.0);
+            toggle_row(
+                ui,
+                &mut self.draft.iv_lyrics_phonetic_use_cli_wrapper_enabled,
+                ivlyrics_phonetic_cli_label(language),
+            );
             ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(saved_path_detail(
-                            language,
-                            &self.paths.prompt_override_path().display().to_string(),
-                        ))
-                        .color(muted_text()),
-                    );
-                    ui.label(RichText::new(prompt_editor_detail(language)).color(muted_text()));
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                    if ui.button(save_button(language)).clicked() {
-                        self.save_prompt_editor();
-                    }
-                    if ui.button(reload_button(language)).clicked() {
-                        self.reload_prompt_editor();
-                    }
-                    if ui.button(load_defaults_button(language)).clicked() {
-                        self.load_default_prompt_editor();
-                    }
-                });
+                ui.add_space(22.0);
+                ui.label(RichText::new(ivlyrics_phonetic_cli_detail(language)).color(muted_text()));
             });
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(preset_label(language)).color(text()));
-                let selected_label = self.selected_prompt_preset_label();
-                let presets = self.prompt_presets.clone();
-                egui::ComboBox::from_id_salt("prompt_preset_combo")
-                    .width((ui.available_width() - 270.0).max(260.0))
-                    .selected_text(selected_label)
-                    .show_ui(ui, |ui| {
-                        for preset in presets {
-                            ui.selectable_value(
-                                &mut self.selected_prompt_preset_id,
-                                preset.id,
-                                preset.display_name,
-                            );
+
+            ui.add_space(16.0);
+            compact_card_frame(surface_raised(), border()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(prompt_current_title(language))
+                                .size(16.0)
+                                .strong()
+                                .color(text()),
+                        );
+                        ui.label(
+                            RichText::new(saved_path_detail(
+                                language,
+                                &self.paths.prompt_override_path().display().to_string(),
+                            ))
+                            .size(12.0)
+                            .color(muted_text()),
+                        );
+                        ui.label(
+                            RichText::new(prompt_editor_detail(language))
+                                .size(12.0)
+                                .color(muted_text()),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                        if ui
+                            .add_sized([72.0, 32.0], egui::Button::new(save_button(language)))
+                            .clicked()
+                        {
+                            self.save_prompt_editor();
+                        }
+                        if ui
+                            .add_sized([86.0, 32.0], egui::Button::new(reload_button(language)))
+                            .clicked()
+                        {
+                            self.reload_prompt_editor();
+                        }
+                        if ui
+                            .add_sized(
+                                [118.0, 32.0],
+                                egui::Button::new(load_defaults_button(language)),
+                            )
+                            .clicked()
+                        {
+                            self.load_default_prompt_editor();
                         }
                     });
-                if ui.button(load_button(language)).clicked() {
-                    self.load_selected_prompt_preset();
-                }
-                if ui.button(save_preset_button(language)).clicked() {
-                    self.save_prompt_preset();
-                }
-                let delete_enabled = self
-                    .selected_prompt_preset()
-                    .map(|preset| preset.is_user_preset)
-                    .unwrap_or(false);
-                if ui
-                    .add_enabled(
-                        delete_enabled,
-                        egui::Button::new(delete_preset_button(language)),
-                    )
-                    .clicked()
-                {
-                    self.delete_selected_prompt_preset();
-                }
+                });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(preset_label(language)).color(muted_text()));
+                    let selected_label = self.selected_prompt_preset_label();
+                    let presets = self.prompt_presets.clone();
+                    let mut preset_changed = false;
+                    egui::ComboBox::from_id_salt("prompt_preset_combo")
+                        .width((ui.available_width() - 210.0).max(260.0))
+                        .selected_text(selected_label)
+                        .show_ui(ui, |ui| {
+                            for preset in presets {
+                                preset_changed |= ui
+                                    .selectable_value(
+                                        &mut self.selected_prompt_preset_id,
+                                        preset.id,
+                                        preset.display_name,
+                                    )
+                                    .changed();
+                            }
+                        });
+                    if preset_changed {
+                        self.load_selected_prompt_preset();
+                    }
+                    if ui
+                        .add_sized(
+                            [112.0, 32.0],
+                            egui::Button::new(save_preset_button(language)),
+                        )
+                        .clicked()
+                    {
+                        self.save_prompt_preset();
+                    }
+                    let delete_enabled = self
+                        .selected_prompt_preset()
+                        .map(|preset| preset.is_user_preset)
+                        .unwrap_or(false);
+                    if ui
+                        .add_enabled_ui(delete_enabled, |ui| {
+                            ui.add_sized(
+                                [68.0, 32.0],
+                                egui::Button::new(delete_preset_button(language)),
+                            )
+                        })
+                        .inner
+                        .clicked()
+                    {
+                        self.delete_selected_prompt_preset();
+                    }
+                });
+                ui.add_space(10.0);
+                ui.add_sized(
+                    [ui.available_width(), 430.0],
+                    egui::TextEdit::multiline(&mut self.prompt_editor_text)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY)
+                        .lock_focus(true),
+                );
             });
-            ui.add_space(10.0);
-            ui.add_sized(
-                [ui.available_width(), 430.0],
-                egui::TextEdit::multiline(&mut self.prompt_editor_text)
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(f32::INFINITY)
-                    .lock_focus(true),
-            );
         });
     }
 
@@ -2419,8 +2630,12 @@ fn webview_instance_count_label(language: UiLanguage) -> &'static str {
     )
 }
 
-fn instances_unit_label(language: UiLanguage) -> &'static str {
-    tr(language, "\u{AC1C}", "instances")
+fn webview_instance_count_hint(language: UiLanguage) -> &'static str {
+    tr(
+        language,
+        "provider당 최대 3, 총 6",
+        "max 3 per provider, 6 total",
+    )
 }
 
 fn refresh_every_label(language: UiLanguage) -> &'static str {
@@ -2503,12 +2718,24 @@ fn local_api_key_label(language: UiLanguage) -> &'static str {
     tr(language, "로컬 API 키", "Local API key")
 }
 
-fn generate_button(language: UiLanguage) -> &'static str {
-    tr(language, "생성", "Generate")
+fn local_api_key_all_valid_label(language: UiLanguage) -> &'static str {
+    tr(language, "전부 유효", "All valid")
 }
 
-fn copy_button(language: UiLanguage) -> &'static str {
-    tr(language, "복사", "Copy")
+fn add_key_button(language: UiLanguage) -> &'static str {
+    tr(language, "키 추가", "Add key")
+}
+
+fn delete_key_button(language: UiLanguage) -> &'static str {
+    tr(language, "삭제", "Delete")
+}
+
+fn copy_selected_button(language: UiLanguage) -> &'static str {
+    tr(language, "선택 복사", "Copy selected")
+}
+
+fn copy_all_button(language: UiLanguage) -> &'static str {
+    tr(language, "전체 복사", "Copy all")
 }
 
 fn request_stats_title(language: UiLanguage) -> &'static str {
@@ -3177,20 +3404,35 @@ fn fast_wrapper_cache_cleared_status(language: UiLanguage) -> &'static str {
     )
 }
 
-fn local_api_key_generated_status(language: UiLanguage) -> &'static str {
+fn local_api_key_added_status(language: UiLanguage) -> &'static str {
     tr(
         language,
-        "새 로컬 API 키를 생성하고 복사했습니다.",
-        "Generated and copied a new local API key.",
+        "새 로컬 API 키를 추가했습니다.",
+        "Added a new local API key.",
     )
 }
 
-fn local_api_key_copied_status(language: UiLanguage) -> &'static str {
+fn local_api_key_deleted_status(language: UiLanguage) -> &'static str {
     tr(
         language,
-        "로컬 API 키를 복사했습니다.",
-        "Local API key copied.",
+        "선택한 로컬 API 키를 삭제했습니다.",
+        "Deleted the selected local API key.",
     )
+}
+
+fn local_api_key_selected_copied_status(language: UiLanguage) -> &'static str {
+    tr(
+        language,
+        "선택한 로컬 API 키를 복사했습니다.",
+        "Copied the selected local API key.",
+    )
+}
+
+fn local_api_key_all_copied_status(language: UiLanguage, count: usize) -> String {
+    match language {
+        UiLanguage::Korean => format!("로컬 API 키 {count}개를 복사했습니다."),
+        UiLanguage::English => format!("Copied {count} local API key(s)."),
+    }
 }
 
 fn stats_refreshed_status(language: UiLanguage) -> &'static str {
