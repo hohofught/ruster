@@ -1,19 +1,26 @@
 use std::time::Duration;
 
 use regex::Regex;
+use serde_json::Value;
 
 use crate::app_paths::AppPaths;
-use crate::host::TranslatorHost;
+use crate::host::{TranslatorHost, WebViewProvider};
 use crate::ivlyrics::IvLyricsTranslationRewriteInput;
 use crate::logging::{LogBuffer, summarize_text};
 use crate::prompt_config::PromptConfig;
 use crate::settings::AppSettings;
 
 const PRESET_A_ID: &str = "embedded:japanese-expressive-translation-optimized";
+const PRESET_B_ID: &str = "embedded:experimental-lyric-translation";
 const PRESET_C_ID: &str = "embedded:long-lyric-translation";
 const PRESET_D_ID: &str = "embedded:integrated-concise-lyric-translation";
 const PRESET_E_ID: &str = "default";
 const MAX_CLASSIFIER_INPUT_CHARS: usize = 12_000;
+
+pub struct AutoPromptTranslationPrompt {
+    pub prompt: String,
+    pub preferred_provider: WebViewProvider,
+}
 
 pub async fn build_translation_prompt(
     paths: &AppPaths,
@@ -22,9 +29,12 @@ pub async fn build_translation_prompt(
     default_config: &PromptConfig,
     input: &IvLyricsTranslationRewriteInput,
     logs: &LogBuffer,
-) -> String {
+) -> AutoPromptTranslationPrompt {
     if !settings.iv_lyrics_auto_prompt_selection_enabled {
-        return build_prompt(default_config, input, "");
+        return AutoPromptTranslationPrompt {
+            prompt: build_prompt(default_config, input, ""),
+            preferred_provider: WebViewProvider::Current,
+        };
     }
 
     let decision = classify(host, input, logs).await;
@@ -38,12 +48,16 @@ pub async fn build_translation_prompt(
     let prompt = build_prompt(&config, input, &decision.append_instruction);
 
     logs.push(format!(
-        "[AutoPrompt] selected={} source={} append={}",
+        "[AutoPrompt] selected={}/{} source={} append={}",
+        decision.provider.label(),
         decision.code,
         decision.source,
         summarize_text(&decision.append_instruction, 80)
     ));
-    prompt
+    AutoPromptTranslationPrompt {
+        prompt,
+        preferred_provider: decision.provider,
+    }
 }
 
 async fn classify(
@@ -119,15 +133,27 @@ fn parse_decision(response: &str) -> Option<AutoPromptDecision> {
     let fence = Regex::new(r"(?im)^\s*```[a-z0-9_-]*\s*$").ok()?;
     let normalized = response.replace("\r\n", "\n").replace('\r', "\n");
     let normalized = fence.replace_all(&normalized, "");
+    if let Some(decision) = try_parse_json_decision(&normalized) {
+        return Some(decision);
+    }
+
     let prompt_match = Regex::new(r"(?im)^\s*prompt\s*:\s*(?P<code>[abcde])\s*$")
         .ok()?
         .captures(&normalized)?;
+    let provider = Regex::new(
+        r"(?im)^\s*(?:provider|service)\s*:\s*(?P<provider>gemini|gem|chatgpt|gpt|chat)\s*$",
+    )
+    .ok()
+    .and_then(|regex| regex.captures(&normalized))
+    .and_then(|caps| caps.name("provider"))
+    .map(|m| map_provider(m.as_str()))
+    .unwrap_or(WebViewProvider::Gemini);
     let append_match = Regex::new(r"(?im)^\s*append\s*:\s*(?P<append>.*?)\s*$")
         .ok()?
         .captures(&normalized);
 
     let raw_code = prompt_match.name("code")?.as_str().to_ascii_lowercase();
-    let code = if raw_code == "b" { "c" } else { &raw_code }.to_owned();
+    let code = raw_code;
     let append = append_match
         .and_then(|caps| caps.name("append"))
         .map(|m| sanitize_append_instruction(m.as_str()))
@@ -136,9 +162,52 @@ fn parse_decision(response: &str) -> Option<AutoPromptDecision> {
     Some(AutoPromptDecision {
         preset_id: map_code_to_preset_id(&code).to_owned(),
         code,
+        provider,
         append_instruction: append,
         source: "gpt-classifier".to_owned(),
     })
+}
+
+fn try_parse_json_decision(normalized: &str) -> Option<AutoPromptDecision> {
+    let root: Value = serde_json::from_str(normalized.trim()).ok()?;
+    let code = root
+        .get("prompt")
+        .or_else(|| root.get("preset"))
+        .and_then(Value::as_str)?
+        .trim()
+        .to_ascii_lowercase();
+    let code = Regex::new(r"^[abcde]$")
+        .ok()?
+        .is_match(&code)
+        .then_some(code)?;
+    let provider = root
+        .get("provider")
+        .or_else(|| root.get("service"))
+        .and_then(Value::as_str)
+        .map(map_provider)
+        .unwrap_or(WebViewProvider::Gemini);
+    let append = root
+        .get("append")
+        .or_else(|| root.get("instruction"))
+        .and_then(Value::as_str)
+        .map(sanitize_append_instruction)
+        .unwrap_or_default();
+
+    Some(AutoPromptDecision {
+        preset_id: map_code_to_preset_id(&code).to_owned(),
+        code,
+        provider,
+        append_instruction: append,
+        source: "gpt-classifier".to_owned(),
+    })
+}
+
+fn map_provider(provider: &str) -> WebViewProvider {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "chatgpt" | "gpt" | "chat" => WebViewProvider::ChatGpt,
+        "gemini" | "gem" => WebViewProvider::Gemini,
+        _ => WebViewProvider::Gemini,
+    }
 }
 
 fn sanitize_append_instruction(value: &str) -> String {
@@ -197,7 +266,8 @@ fn build_prompt(
 fn map_code_to_preset_id(code: &str) -> &'static str {
     match code {
         "a" => PRESET_A_ID,
-        "b" | "c" => PRESET_C_ID,
+        "b" => PRESET_B_ID,
+        "c" => PRESET_C_ID,
         "d" => PRESET_D_ID,
         "e" => PRESET_E_ID,
         _ => PRESET_E_ID,
@@ -221,6 +291,7 @@ fn trim_classifier_input(numbered_lyrics: &str) -> String {
 struct AutoPromptDecision {
     code: String,
     preset_id: String,
+    provider: WebViewProvider,
     append_instruction: String,
     source: String,
 }
@@ -230,8 +301,48 @@ impl AutoPromptDecision {
         Self {
             code: "e".to_owned(),
             preset_id: PRESET_E_ID.to_owned(),
+            provider: WebViewProvider::Gemini,
             append_instruction: String::new(),
             source: source.to_owned(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_prompt_json_decision_keeps_provider_and_b_preset() {
+        let decision = parse_decision(
+            r#"{"provider":"chatgpt","prompt":"b","append":"keep narrative logic"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(decision.provider, WebViewProvider::ChatGpt);
+        assert_eq!(decision.code, "b");
+        assert_eq!(decision.preset_id, PRESET_B_ID);
+        assert_eq!(decision.append_instruction, "keep narrative logic");
+    }
+
+    #[test]
+    fn auto_prompt_line_decision_reads_provider() {
+        let decision =
+            parse_decision("provider: gemini\nprompt: d\nappend: preserve rough speaker tone")
+                .unwrap();
+
+        assert_eq!(decision.provider, WebViewProvider::Gemini);
+        assert_eq!(decision.code, "d");
+        assert_eq!(decision.preset_id, PRESET_D_ID);
+        assert_eq!(decision.append_instruction, "preserve rough speaker tone");
+    }
+
+    #[test]
+    fn auto_prompt_none_append_is_empty() {
+        let decision = parse_decision("provider: chatgpt\nprompt: e\nappend: none").unwrap();
+
+        assert_eq!(decision.provider, WebViewProvider::ChatGpt);
+        assert_eq!(decision.code, "e");
+        assert!(decision.append_instruction.is_empty());
     }
 }

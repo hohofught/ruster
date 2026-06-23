@@ -10,6 +10,7 @@ use crate::fast_client::{self, FastGenerationConfig, FastGenerationOptions};
 use crate::gemini_gate;
 use crate::logging;
 use crate::model_catalog;
+use crate::model_catalog::CliProvider;
 use crate::settings::AppSettings;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +95,10 @@ impl GeminiCliClient {
     pub fn with_fast_wrapper_from_settings(mut self, settings: &AppSettings) -> Self {
         self.use_fast_wrapper = settings.gemini_cli_use_fast_wrapper;
         self.fast_config = FastGenerationConfig::from_settings(settings);
+        self.model = model_catalog::apply_cli_thinking_level(
+            &self.model,
+            &settings.gemini_fast_thinking_level,
+        );
         self
     }
 
@@ -209,7 +214,7 @@ impl GeminiCliClient {
         prompt: &str,
         attempt: u8,
     ) -> Result<String, GeminiCliError> {
-        if self.use_fast_wrapper {
+        if self.use_fast_wrapper && !cli_discovery::should_use_antigravity_fast_backend() {
             println!(
                 "[GeminiCli] fast wrapper send (attempt={attempt}, model={}, thinkingLevel={}, thinkingBudget={}, nativeFallback={}, httpAttempts={}, emptyAttempts={})",
                 self.model,
@@ -261,6 +266,11 @@ impl GeminiCliClient {
                 "[GeminiCli] fast wrapper failed - native CLI fallback ({})",
                 logging::summarize_text(&fast_result.error, 180)
             );
+        } else if self.use_fast_wrapper {
+            println!(
+                "[GeminiCli] Antigravity native path - fast wrapper skipped (attempt={attempt}, model={})",
+                self.model
+            );
         } else {
             println!(
                 "[GeminiCli] fast wrapper skipped - native CLI direct (attempt={attempt}, model={})",
@@ -268,21 +278,7 @@ impl GeminiCliClient {
             );
         }
 
-        let output = self
-            .run_process(
-                &[
-                    "--model",
-                    &self.model,
-                    "--prompt",
-                    prompt,
-                    "--output-format",
-                    "text",
-                ],
-                self.timeout,
-                Some(attempt),
-            )
-            .await?;
-        Ok(output.stdout)
+        self.run_native_prompt(prompt, attempt).await
     }
 
     pub async fn probe_native_models(
@@ -295,22 +291,8 @@ impl GeminiCliClient {
         let mut out = Vec::with_capacity(models.len());
         for model in models {
             let client = GeminiCliClient::new(model.id.to_owned(), per_model_timeout.as_secs());
-            match client
-                .run_process(
-                    &[
-                        "--model",
-                        model.id,
-                        "--prompt",
-                        "Reply with exactly OK.",
-                        "--output-format",
-                        "text",
-                    ],
-                    per_model_timeout,
-                    None,
-                )
-                .await
-            {
-                Ok(result) if result.stdout.to_ascii_uppercase().contains("OK") => {
+            match client.run_native_prompt("Reply with exactly OK.", 1).await {
+                Ok(text) if text.to_ascii_uppercase().contains("OK") => {
                     out.push(GeminiModelAvailabilityResult {
                         model: model.clone(),
                         available: true,
@@ -318,13 +300,13 @@ impl GeminiCliClient {
                         error: String::new(),
                     });
                 }
-                Ok(result) => out.push(GeminiModelAvailabilityResult {
+                Ok(text) => out.push(GeminiModelAvailabilityResult {
                     model: model.clone(),
                     available: false,
                     source: source.clone(),
                     error: format!(
-                        "검증 응답에 OK가 없습니다: {}",
-                        logging::summarize_text(merge_output(&result.stdout, &result.stderr), 160)
+                        "Verification response missing OK: {}",
+                        logging::summarize_text(&text, 160)
                     ),
                 }),
                 Err(error) => out.push(GeminiModelAvailabilityResult {
@@ -338,6 +320,66 @@ impl GeminiCliClient {
         out
     }
 
+    async fn run_native_prompt(&self, prompt: &str, attempt: u8) -> Result<String, GeminiCliError> {
+        let installation = cli_discovery::find()
+            .map_err(|message| runtime_error(CliErrorType::NotInstalled, message))?;
+        let model = model_catalog::apply_cli_thinking_level_for_provider(
+            &self.model,
+            &self.fast_config.thinking_level,
+            installation.provider,
+        );
+        let variants =
+            build_prompt_argument_variants(installation.provider, &model, prompt, self.timeout);
+        let mut last_error = None;
+
+        for (variant_index, args) in variants.iter().enumerate() {
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            match self
+                .run_process_with_installation(&installation, &args, self.timeout, Some(attempt))
+                .await
+            {
+                Ok(result) => {
+                    let cleaned = clean_output(&result.stdout);
+                    if cleaned.trim().is_empty() {
+                        return Err(runtime_error(
+                            if looks_like_authentication_output(&result.stderr, &result.stdout) {
+                                CliErrorType::AuthExpired
+                            } else {
+                                CliErrorType::EmptyResponse
+                            },
+                            build_empty_response_detail(
+                                &installation,
+                                &result.stdout,
+                                &result.stderr,
+                            ),
+                        ));
+                    }
+                    return Ok(result.stdout);
+                }
+                Err(error)
+                    if installation.provider == CliProvider::Antigravity
+                        && variant_index + 1 < variants.len()
+                        && looks_like_argument_shape_failure(&error.message) =>
+                {
+                    println!(
+                        "[GeminiCli] Antigravity argument shape retry (attempt={attempt}, variant={}/{})",
+                        variant_index + 1,
+                        variants.len()
+                    );
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            runtime_error(
+                CliErrorType::Unknown,
+                "Antigravity CLI prompt failed before producing output".to_owned(),
+            )
+        }))
+    }
+
     async fn run_process(
         &self,
         args: &[&str],
@@ -346,7 +388,17 @@ impl GeminiCliClient {
     ) -> Result<ProcessResult, GeminiCliError> {
         let installation = cli_discovery::find()
             .map_err(|message| runtime_error(CliErrorType::NotInstalled, message))?;
+        self.run_process_with_installation(&installation, args, timeout, attempt)
+            .await
+    }
 
+    async fn run_process_with_installation(
+        &self,
+        installation: &cli_discovery::GeminiCliInstallation,
+        args: &[&str],
+        timeout: Duration,
+        attempt: Option<u8>,
+    ) -> Result<ProcessResult, GeminiCliError> {
         let _ = std::fs::create_dir_all(&self.working_dir);
         let mut command = Command::new(&installation.file_name);
         command.args(&installation.prefix_args);
@@ -415,6 +467,85 @@ impl GeminiCliClient {
         }
 
         Ok(result)
+    }
+}
+
+fn build_prompt_argument_variants(
+    provider: CliProvider,
+    model: &str,
+    prompt: &str,
+    timeout: Duration,
+) -> Vec<Vec<String>> {
+    match provider {
+        CliProvider::Gemini => vec![vec![
+            "--model".to_owned(),
+            model.to_owned(),
+            "--prompt".to_owned(),
+            prompt.to_owned(),
+            "--output-format".to_owned(),
+            "text".to_owned(),
+        ]],
+        CliProvider::Antigravity => {
+            let mut prefix = Vec::new();
+            if !model.trim().is_empty() {
+                prefix.push("--model".to_owned());
+                prefix.push(model.to_owned());
+            }
+            prefix.push("--print-timeout".to_owned());
+            prefix.push(format!("{}s", timeout.as_secs().max(1)));
+
+            let mut variants = Vec::new();
+            for prompt_flag in ["--print", "--prompt", "-p"] {
+                let mut args = prefix.clone();
+                args.push(prompt_flag.to_owned());
+                args.push(prompt.to_owned());
+                variants.push(args);
+            }
+            variants
+        }
+    }
+}
+
+fn looks_like_argument_shape_failure(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+    msg.contains("unknown option")
+        || msg.contains("unknown argument")
+        || msg.contains("unexpected argument")
+        || msg.contains("unrecognized option")
+        || msg.contains("invalid option")
+        || msg.contains("usage:")
+}
+
+fn looks_like_authentication_output(stderr: &str, stdout: &str) -> bool {
+    let merged = format!(
+        "{stderr}
+{stdout}"
+    )
+    .to_ascii_lowercase();
+    merged.contains("auth")
+        || merged.contains("login")
+        || merged.contains("sign in")
+        || merged.contains("credential")
+        || merged.contains("permission denied")
+}
+
+fn build_empty_response_detail(
+    installation: &cli_discovery::GeminiCliInstallation,
+    stdout: &str,
+    stderr: &str,
+) -> String {
+    let detail = merge_output(stdout, stderr);
+    if detail.trim().is_empty() {
+        format!(
+            "{} returned empty stdout/stderr",
+            installation.display_source()
+        )
+    } else {
+        format!(
+            "{} returned empty stdout after diagnostics: {}",
+            installation.display_source(),
+            logging::summarize_text(&detail, 240)
+        )
     }
 }
 
@@ -520,6 +651,12 @@ fn looks_like_rate_limit(msg: &str) -> bool {
         || msg.contains("quota")
         || msg.contains("limit hit")
         || msg.contains("limit exceeded")
+        || msg.contains("limit exhausted")
+        || msg.contains("limit reached")
+        || msg.contains("weekly limit")
+        || msg.contains("five hour limit")
+        || msg.contains("0% remaining")
+        || msg.contains("0.0% remaining")
         || msg.contains("too many requests")
         || msg.contains("요청 제한")
         || msg.contains("요청 한도")

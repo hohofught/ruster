@@ -6,11 +6,15 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-const OFFICIAL_PACKAGE_NAME: &str = "@google/gemini-cli";
+use crate::model_catalog::CliProvider;
+
+const ANTIGRAVITY_OFFICIAL_PACKAGE_NAME: &str = "@google/antigravity-cli";
+const GEMINI_OFFICIAL_PACKAGE_NAME: &str = "@google/gemini-cli";
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct GeminiCliInstallation {
+    pub provider: CliProvider,
     pub file_name: PathBuf,
     pub prefix_args: Vec<String>,
     pub source_path: PathBuf,
@@ -30,13 +34,24 @@ impl GeminiCliInstallation {
             format!("{source} (pkg {})", self.package_version)
         }
     }
+
+    pub fn cli_display_name(&self) -> &'static str {
+        match self.provider {
+            CliProvider::Antigravity => "Antigravity CLI",
+            CliProvider::Gemini => "Gemini CLI",
+        }
+    }
+
+    pub fn command_name(&self) -> &'static str {
+        command_names(self.provider)[0]
+    }
 }
 
 static CACHED_INSTALLATION: OnceLock<Mutex<Option<GeminiCliInstallation>>> = OnceLock::new();
 
 pub fn find() -> Result<GeminiCliInstallation, String> {
     try_find().ok_or_else(|| {
-        "공식 Gemini CLI(@google/gemini-cli)를 찾을 수 없습니다. npm install -g @google/gemini-cli 설치 후 다시 시도해주세요."
+        "Antigravity CLI was not found. Install https://antigravity.google/ and add agy/antigravity to PATH, or set ANTIGRAVITY_CLI_PATH/AGY_CLI_PATH."
             .to_owned()
     })
 }
@@ -67,27 +82,57 @@ pub fn reset_cache() {
     }
 }
 
-fn discover() -> Option<GeminiCliInstallation> {
-    for command_path in get_command_candidates() {
-        if let Some(candidate) = try_build_from_command_path(&command_path) {
-            return Some(candidate);
-        }
+pub fn should_use_antigravity_fast_backend() -> bool {
+    if let Some(installation) = try_find() {
+        return installation.provider == CliProvider::Antigravity;
     }
 
-    for package_dir in get_explicit_package_dir_candidates()
-        .into_iter()
-        .chain(get_global_package_dir_candidates())
-    {
-        if let Some(candidate) = try_build_from_package_dir(&package_dir, package_dir.clone(), None)
+    provider_search_order()
+        .first()
+        .copied()
+        .unwrap_or(CliProvider::Antigravity)
+        == CliProvider::Antigravity
+}
+
+fn discover() -> Option<GeminiCliInstallation> {
+    for provider in provider_search_order() {
+        for command_path in get_command_candidates(provider) {
+            if let Some(candidate) = try_build_from_command_path(provider, &command_path) {
+                return Some(candidate);
+            }
+        }
+
+        for package_dir in get_explicit_package_dir_candidates(provider)
+            .into_iter()
+            .chain(get_global_package_dir_candidates(provider))
         {
-            return Some(candidate);
+            if let Some(candidate) =
+                try_build_from_package_dir(provider, &package_dir, package_dir.clone(), None)
+            {
+                return Some(candidate);
+            }
         }
     }
 
     None
 }
 
-fn try_build_from_command_path(command_path: &Path) -> Option<GeminiCliInstallation> {
+fn provider_search_order() -> Vec<CliProvider> {
+    let requested = std::env::var("LOCALWEBTRANSLATOR_CLI_PROVIDER")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match requested.as_str() {
+        "agy" | "antigravity" | "google-antigravity" => vec![CliProvider::Antigravity],
+        "gemini" | "gemini-cli" => vec![CliProvider::Gemini],
+        _ => vec![CliProvider::Antigravity],
+    }
+}
+
+fn try_build_from_command_path(
+    provider: CliProvider,
+    command_path: &Path,
+) -> Option<GeminiCliInstallation> {
     if !command_path.is_file() {
         return None;
     }
@@ -96,32 +141,56 @@ fn try_build_from_command_path(command_path: &Path) -> Option<GeminiCliInstallat
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_default();
-    let package_dir = try_resolve_package_dir_from_command_path(command_path)
-        .or_else(|| try_resolve_package_dir_from_npm_bin(&command_dir))?;
+    let package_dir = try_resolve_package_dir_from_command_path(provider, command_path)
+        .or_else(|| try_resolve_package_dir_from_npm_bin(provider, &command_dir));
 
-    try_build_from_package_dir(&package_dir, command_path.to_path_buf(), Some(command_dir))
+    if let Some(package_dir) = package_dir {
+        return try_build_from_package_dir(
+            provider,
+            &package_dir,
+            command_path.to_path_buf(),
+            Some(command_dir),
+        );
+    }
+
+    if provider == CliProvider::Antigravity {
+        return Some(GeminiCliInstallation {
+            provider,
+            file_name: command_path.to_path_buf(),
+            prefix_args: Vec::new(),
+            source_path: command_path.to_path_buf(),
+            package_dir: PathBuf::new(),
+            package_version: String::new(),
+            node_path: PathBuf::new(),
+            uses_node_direct: false,
+        });
+    }
+
+    None
 }
 
 fn try_build_from_package_dir(
+    provider: CliProvider,
     package_dir: &Path,
     source_path: PathBuf,
     npm_bin_dir: Option<PathBuf>,
 ) -> Option<GeminiCliInstallation> {
-    if !package_dir.is_dir() || !is_official_package_dir(package_dir) {
+    if !package_dir.is_dir() || !is_known_package_dir(provider, package_dir) {
         return None;
     }
 
-    let entry = try_resolve_package_bin(package_dir)?;
+    let entry = try_resolve_package_bin(provider, package_dir)?;
     if !entry.is_file() {
         return None;
     }
 
-    let node_path = resolve_node_executable(npm_bin_dir.as_deref())?;
+    let node_path = resolve_node_executable(provider, npm_bin_dir.as_deref())?;
     if !node_path.is_file() {
         return None;
     }
 
     Some(GeminiCliInstallation {
+        provider,
         file_name: node_path.clone(),
         prefix_args: vec![entry.display().to_string()],
         source_path,
@@ -132,32 +201,28 @@ fn try_build_from_package_dir(
     })
 }
 
-fn get_command_candidates() -> Vec<PathBuf> {
+fn get_command_candidates(provider: CliProvider) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
 
-    for env_name in ["GEMINI_CLI_PATH", "GEMINI_CLI_COMMAND", "GEMINI_CLI_BIN"] {
+    for env_name in command_env_names(provider) {
         for candidate in expand_command_candidate(std::env::var(env_name).ok().as_deref()) {
             push_unique(&mut candidates, &mut seen, candidate);
         }
     }
 
-    let names: &[&str] = if cfg!(windows) {
-        &["gemini.cmd", "gemini.exe", "gemini.ps1", "gemini"]
-    } else {
-        &["gemini"]
-    };
-
-    for name in names {
-        for candidate in resolve_command_on_path(name) {
-            if cfg!(windows) && candidate.extension().is_none() {
-                continue;
+    for command_name in command_names(provider) {
+        for file_name in command_file_names(command_name) {
+            for candidate in resolve_command_on_path(&file_name) {
+                if cfg!(windows) && candidate.extension().is_none() {
+                    continue;
+                }
+                push_unique(&mut candidates, &mut seen, candidate);
             }
-            push_unique(&mut candidates, &mut seen, candidate);
         }
     }
 
-    for candidate in get_known_gemini_wrapper_candidates() {
+    for candidate in get_known_wrapper_candidates(provider) {
         push_unique(&mut candidates, &mut seen, candidate);
     }
 
@@ -181,10 +246,10 @@ fn expand_command_candidate(raw: Option<&str>) -> Vec<PathBuf> {
     resolve_command_on_path(value)
 }
 
-fn get_explicit_package_dir_candidates() -> Vec<PathBuf> {
+fn get_explicit_package_dir_candidates(provider: CliProvider) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for env_name in ["GEMINI_CLI_PACKAGE_DIR", "GEMINI_CLI_ROOT"] {
+    for env_name in package_dir_env_names(provider) {
         let Ok(raw) = std::env::var(env_name) else {
             continue;
         };
@@ -196,14 +261,35 @@ fn get_explicit_package_dir_candidates() -> Vec<PathBuf> {
     out
 }
 
-fn get_known_gemini_wrapper_candidates() -> Vec<PathBuf> {
+fn get_known_wrapper_candidates(provider: CliProvider) -> Vec<PathBuf> {
     let mut out = Vec::new();
+    if provider == CliProvider::Antigravity
+        && cfg!(windows)
+        && let Some(local_app_data) = dirs::data_local_dir()
+    {
+        for name in [
+            "agy.exe",
+            "agy.cmd",
+            "agy.ps1",
+            "antigravity.exe",
+            "antigravity.cmd",
+            "antigravity.ps1",
+        ] {
+            let candidate = local_app_data.join("agy").join("bin").join(name);
+            if candidate.is_file() {
+                out.push(candidate);
+            }
+        }
+    }
+
     if cfg!(windows) {
         for bin_dir in get_known_windows_package_bin_dirs() {
-            for name in ["gemini.cmd", "gemini.ps1", "gemini.exe"] {
-                let candidate = bin_dir.join(name);
-                if candidate.is_file() {
-                    out.push(candidate);
+            for command_name in command_names(provider) {
+                for file_name in command_file_names(command_name) {
+                    let candidate = bin_dir.join(file_name);
+                    if candidate.is_file() {
+                        out.push(candidate);
+                    }
                 }
             }
         }
@@ -211,27 +297,33 @@ fn get_known_gemini_wrapper_candidates() -> Vec<PathBuf> {
     }
 
     let home = dirs::home_dir().unwrap_or_default();
-    for path in [
-        PathBuf::from("/usr/local/bin/gemini"),
-        PathBuf::from("/opt/homebrew/bin/gemini"),
-        home.join(".npm-global").join("bin").join("gemini"),
-        home.join(".local").join("bin").join("gemini"),
-    ] {
-        if path.is_file() {
-            out.push(path);
+    for command_name in command_names(provider) {
+        for path in [
+            PathBuf::from("/usr/local/bin").join(command_name),
+            PathBuf::from("/opt/homebrew/bin").join(command_name),
+            home.join(".npm-global").join("bin").join(command_name),
+            home.join(".local").join("bin").join(command_name),
+        ] {
+            if path.is_file() {
+                out.push(path);
+            }
         }
     }
     out
 }
 
-fn get_global_package_dir_candidates() -> Vec<PathBuf> {
+fn get_global_package_dir_candidates(provider: CliProvider) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
 
     for root in get_global_node_module_roots() {
-        let package_dir = root.join("@google").join("gemini-cli");
-        if package_dir.is_dir() {
-            push_unique(&mut out, &mut seen, package_dir);
+        for package_name in package_names(provider) {
+            let package_dir = package_name
+                .split('/')
+                .fold(root.clone(), |path, part| path.join(part));
+            if package_dir.is_dir() {
+                push_unique(&mut out, &mut seen, package_dir);
+            }
         }
     }
 
@@ -304,40 +396,58 @@ fn get_known_windows_package_bin_dirs() -> Vec<PathBuf> {
     out
 }
 
-fn try_resolve_package_dir_from_npm_bin(npm_bin_dir: &Path) -> Option<PathBuf> {
-    let candidate = npm_bin_dir
-        .join("node_modules")
-        .join("@google")
-        .join("gemini-cli");
-    candidate.is_dir().then_some(candidate)
+fn try_resolve_package_dir_from_npm_bin(
+    provider: CliProvider,
+    npm_bin_dir: &Path,
+) -> Option<PathBuf> {
+    for package_name in package_names(provider) {
+        let candidate = package_name
+            .split('/')
+            .fold(npm_bin_dir.join("node_modules"), |path, part| {
+                path.join(part)
+            });
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
-fn try_resolve_package_dir_from_command_path(command_path: &Path) -> Option<PathBuf> {
+fn try_resolve_package_dir_from_command_path(
+    provider: CliProvider,
+    command_path: &Path,
+) -> Option<PathBuf> {
     let mut cursor = command_path.parent();
     for _ in 0..8 {
         let Some(dir) = cursor else {
             break;
         };
-        if dir.join("package.json").is_file()
-            && try_read_package_string(dir, "name").eq_ignore_ascii_case(OFFICIAL_PACKAGE_NAME)
-        {
-            return Some(dir.to_path_buf());
+        if dir.join("package.json").is_file() {
+            let package_name = try_read_package_string(dir, "name");
+            if package_names(provider)
+                .iter()
+                .any(|name| package_name.eq_ignore_ascii_case(name))
+            {
+                return Some(dir.to_path_buf());
+            }
         }
         cursor = dir.parent();
     }
     None
 }
 
-fn try_resolve_package_bin(package_dir: &Path) -> Option<PathBuf> {
+fn try_resolve_package_bin(provider: CliProvider, package_dir: &Path) -> Option<PathBuf> {
     let package_json = package_dir.join("package.json");
     if let Ok(text) = std::fs::read_to_string(&package_json)
         && let Ok(value) = serde_json::from_str::<Value>(&text)
     {
         let relative = value.get("bin").and_then(|bin| {
             bin.as_str().map(ToOwned::to_owned).or_else(|| {
-                bin.get("gemini")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
+                command_names(provider).iter().find_map(|command_name| {
+                    bin.get(*command_name)
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
             })
         });
         if let Some(relative) = relative {
@@ -348,7 +458,7 @@ fn try_resolve_package_bin(package_dir: &Path) -> Option<PathBuf> {
         }
     }
 
-    for fallback in ["bundle/gemini.js", "dist/index.js"] {
+    for fallback in package_bin_fallbacks(provider) {
         let candidate = package_dir.join(fallback.replace('/', std::path::MAIN_SEPARATOR_STR));
         if candidate.is_file() {
             return Some(candidate);
@@ -357,15 +467,20 @@ fn try_resolve_package_bin(package_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-fn is_official_package_dir(package_dir: &Path) -> bool {
-    try_read_package_string(package_dir, "name").eq_ignore_ascii_case(OFFICIAL_PACKAGE_NAME)
+fn is_known_package_dir(provider: CliProvider, package_dir: &Path) -> bool {
+    let package_name = try_read_package_string(package_dir, "name");
+    package_names(provider)
+        .iter()
+        .any(|name| package_name.eq_ignore_ascii_case(name))
 }
 
-fn resolve_node_executable(npm_bin_dir: Option<&Path>) -> Option<PathBuf> {
-    if let Ok(raw) = std::env::var("GEMINI_CLI_NODE_PATH") {
-        let candidate = PathBuf::from(raw.trim().trim_matches('"'));
-        if candidate.is_file() {
-            return Some(candidate);
+fn resolve_node_executable(provider: CliProvider, npm_bin_dir: Option<&Path>) -> Option<PathBuf> {
+    for env_name in node_env_names(provider) {
+        if let Ok(raw) = std::env::var(env_name) {
+            let candidate = PathBuf::from(raw.trim().trim_matches('"'));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
 
@@ -434,6 +549,84 @@ fn resolve_command_on_path(command_name: &str) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+fn command_env_names(provider: CliProvider) -> &'static [&'static str] {
+    match provider {
+        CliProvider::Antigravity => &[
+            "ANTIGRAVITY_CLI_PATH",
+            "ANTIGRAVITY_CLI_COMMAND",
+            "ANTIGRAVITY_CLI_BIN",
+            "AGY_CLI_PATH",
+            "AGY_CLI_COMMAND",
+            "AGY_CLI_BIN",
+        ],
+        CliProvider::Gemini => &["GEMINI_CLI_PATH", "GEMINI_CLI_COMMAND", "GEMINI_CLI_BIN"],
+    }
+}
+
+fn package_dir_env_names(provider: CliProvider) -> &'static [&'static str] {
+    match provider {
+        CliProvider::Antigravity => &[
+            "ANTIGRAVITY_CLI_PACKAGE_DIR",
+            "ANTIGRAVITY_CLI_ROOT",
+            "AGY_CLI_PACKAGE_DIR",
+            "AGY_CLI_ROOT",
+        ],
+        CliProvider::Gemini => &["GEMINI_CLI_PACKAGE_DIR", "GEMINI_CLI_ROOT"],
+    }
+}
+
+fn node_env_names(provider: CliProvider) -> &'static [&'static str] {
+    match provider {
+        CliProvider::Antigravity => &[
+            "ANTIGRAVITY_CLI_NODE_PATH",
+            "AGY_CLI_NODE_PATH",
+            "GEMINI_CLI_NODE_PATH",
+        ],
+        CliProvider::Gemini => &["GEMINI_CLI_NODE_PATH"],
+    }
+}
+
+fn package_names(provider: CliProvider) -> &'static [&'static str] {
+    match provider {
+        CliProvider::Antigravity => &[ANTIGRAVITY_OFFICIAL_PACKAGE_NAME, "antigravity-cli"],
+        CliProvider::Gemini => &[GEMINI_OFFICIAL_PACKAGE_NAME],
+    }
+}
+
+fn command_names(provider: CliProvider) -> &'static [&'static str] {
+    match provider {
+        CliProvider::Antigravity => &["agy", "antigravity"],
+        CliProvider::Gemini => &["gemini"],
+    }
+}
+
+fn command_file_names(command_name: &str) -> Vec<String> {
+    if !cfg!(windows) {
+        return vec![command_name.to_owned()];
+    }
+    vec![
+        format!("{command_name}.cmd"),
+        format!("{command_name}.exe"),
+        format!("{command_name}.ps1"),
+        command_name.to_owned(),
+    ]
+}
+
+fn package_bin_fallbacks(provider: CliProvider) -> &'static [&'static str] {
+    match provider {
+        CliProvider::Antigravity => &[
+            "bundle/agy.js",
+            "bundle/antigravity.js",
+            "dist/agy.js",
+            "dist/antigravity.js",
+            "dist/index.js",
+            "bin/agy.js",
+            "bin/antigravity.js",
+        ],
+        CliProvider::Gemini => &["bundle/gemini.js", "dist/index.js"],
+    }
 }
 
 fn run_command_first_line(file_name: &str, args: &[&str], timeout: Duration) -> Option<String> {

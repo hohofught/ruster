@@ -361,7 +361,7 @@ impl RusterApp {
             settings_arc.clone(),
             logs.clone(),
             selected_mode,
-            paths.webview_user_data_dir("profiles"),
+            paths.webview_data_dir(),
             paths.ivlyrics_study_limit_guard_path(),
         ));
         logs.push(format!(
@@ -1307,6 +1307,16 @@ impl RusterApp {
                     &mut self.draft.web_view_raw_mode,
                     webview_raw_label(language),
                 );
+                toggle_row(
+                    ui,
+                    &mut self.draft.maximum_usage_mode_enabled,
+                    maximum_usage_label(language),
+                );
+                toggle_row(
+                    ui,
+                    &mut self.draft.web_view_parallel_processing_enabled,
+                    webview_parallel_label(language),
+                );
                 ui.add_space(18.0);
                 egui::Grid::new("webview_runtime_grid")
                     .num_columns(3)
@@ -1331,6 +1341,16 @@ impl RusterApp {
                         );
                         ui.label(RichText::new(seconds_unit_label(language)).color(muted_text()));
                         ui.end_row();
+
+                        ui.label(webview_instance_count_label(language));
+                        ui.add_sized(
+                            [90.0, 32.0],
+                            egui::DragValue::new(&mut self.draft.web_view_instance_count)
+                                .range(1..=5)
+                                .speed(1),
+                        );
+                        ui.label(RichText::new(instances_unit_label(language)).color(muted_text()));
+                        ui.end_row();
                     });
 
                 let ui = &mut columns[1];
@@ -1341,7 +1361,7 @@ impl RusterApp {
                     .width(ui.available_width())
                     .selected_text(self.draft.gemini_cli_model.clone())
                     .show_ui(ui, |ui| {
-                        for model in model_catalog::CLI_MODELS {
+                        for model in model_catalog::cli_models_for_current_provider() {
                             ui.selectable_value(
                                 &mut self.draft.gemini_cli_model,
                                 model.id.to_owned(),
@@ -2373,6 +2393,34 @@ fn webview_quality_label(language: UiLanguage) -> &'static str {
 
 fn webview_raw_label(language: UiLanguage) -> &'static str {
     tr(language, "WebView Raw 모드", "WebView raw mode")
+}
+
+fn maximum_usage_label(language: UiLanguage) -> &'static str {
+    tr(
+        language,
+        "\u{CD5C}\u{B300} \u{C0AC}\u{C6A9}\u{B7C9} \u{BAA8}\u{B4DC}",
+        "Maximum usage mode",
+    )
+}
+
+fn webview_parallel_label(language: UiLanguage) -> &'static str {
+    tr(
+        language,
+        "WebView \u{BCD1}\u{B82C} \u{CC98}\u{B9AC}",
+        "WebView parallel processing",
+    )
+}
+
+fn webview_instance_count_label(language: UiLanguage) -> &'static str {
+    tr(
+        language,
+        "WebView \u{C778}\u{C2A4}\u{D134}\u{C2A4} \u{C218}",
+        "WebView instances",
+    )
+}
+
+fn instances_unit_label(language: UiLanguage) -> &'static str {
+    tr(language, "\u{AC1C}", "instances")
 }
 
 fn refresh_every_label(language: UiLanguage) -> &'static str {
@@ -3492,7 +3540,8 @@ async fn probe_and_store_cli_models(
     selected_model: String,
 ) -> bool {
     let settings_snapshot = settings.read().clone().normalized();
-    let use_fast_wrapper = settings_snapshot.gemini_cli_use_fast_wrapper;
+    let use_fast_wrapper = settings_snapshot.gemini_cli_use_fast_wrapper
+        && !cli_discovery::should_use_antigravity_fast_backend();
     logs.push(format!(
         "[GeminiCli] 사용 가능 CLI 모델 검증 시작 (preferred={selected_model}, mode={})",
         if use_fast_wrapper {
@@ -3510,7 +3559,7 @@ async fn probe_and_store_cli_models(
 
     if use_fast_wrapper {
         let results = fast_client::probe_models(
-            model_catalog::CLI_MODELS,
+            model_catalog::cli_models_for_current_provider(),
             std::time::Duration::from_secs(25),
             FastGenerationConfig::from_settings(&settings_snapshot),
         )
@@ -3547,7 +3596,7 @@ async fn probe_and_store_cli_models(
         }
     } else {
         let results = GeminiCliClient::probe_native_models(
-            model_catalog::CLI_MODELS,
+            model_catalog::cli_models_for_current_provider(),
             std::time::Duration::from_secs(25),
         )
         .await;

@@ -16,6 +16,7 @@ use crate::cli_discovery;
 use crate::gemini_gate;
 use crate::logging;
 use crate::model_catalog;
+use crate::model_catalog::CliProvider;
 use crate::settings::AppSettings;
 
 const CODE_ASSIST_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com";
@@ -76,8 +77,9 @@ impl FastGenerationOptions {
         timeout: Duration,
         config: FastGenerationConfig,
     ) -> Self {
+        let model = model.into();
         Self {
-            model: model_catalog::normalize_cli_model(&model.into()),
+            model: model_catalog::normalize_cli_model_for_provider(&model, CliProvider::Gemini),
             prompt: prompt.into(),
             timeout: timeout.max(Duration::from_secs(1)),
             config,
@@ -1193,7 +1195,7 @@ fn build_user_agent(model: &str) -> String {
         _ => "linux",
     };
     let model_part = if model.trim().is_empty() {
-        model_catalog::DEFAULT_CLI_MODEL_ID
+        model_catalog::DEFAULT_GEMINI_CLI_MODEL_ID
     } else {
         model.trim()
     };

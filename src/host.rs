@@ -16,7 +16,14 @@ use crate::logging::{LogBuffer, summarize_text};
 use crate::model_catalog;
 use crate::request_guard::{RequestGuard, RequestGuardError};
 use crate::settings::AppSettings;
-use crate::web_backend::{WebAutomationBackend, WebBackendError};
+use crate::web_backend::{WebAutomationBackend, WebBackendError, WebProfileResetResult};
+
+const GENERAL_CLI_PROMPT_TOKEN_BUDGET: usize = 8000;
+const APPROX_CHARS_PER_TOKEN: usize = 4;
+const GENERAL_CLI_PROMPT_CHAR_BUDGET: usize =
+    GENERAL_CLI_PROMPT_TOKEN_BUDGET * APPROX_CHARS_PER_TOKEN;
+const INPUT_LINES_START_MARKER: &str = "INPUT_LINES_START";
+const INPUT_LINES_END_MARKER: &str = "INPUT_LINES_END";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TranslationMode {
@@ -31,6 +38,31 @@ impl TranslationMode {
             Self::WebView => "Gemini WebView",
             Self::GeminiCli => "Gemini CLI",
             Self::ChatGptWebView => "ChatGPT WebView",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebViewProvider {
+    Current,
+    Gemini,
+    ChatGpt,
+}
+
+impl WebViewProvider {
+    fn mode(self, current: TranslationMode) -> TranslationMode {
+        match self {
+            Self::Current => current,
+            Self::Gemini => TranslationMode::WebView,
+            Self::ChatGpt => TranslationMode::ChatGptWebView,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Gemini => "gemini",
+            Self::ChatGpt => "chatgpt",
         }
     }
 }
@@ -260,21 +292,30 @@ impl IvLyricsStudyCliLimitGuard {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum HostRequestPriority {
     Normal,
+    High,
     Immediate,
 }
 
 struct PriorityGate {
     state: ParkingMutex<PriorityGateState>,
-    notify: Notify,
 }
 
 #[derive(Default)]
 struct PriorityGateState {
     active: bool,
-    immediate_waiters: usize,
-    normal_waiters: usize,
+    next_waiter_id: u64,
+    granted_waiter_id: Option<u64>,
+    immediate_queue: VecDeque<PriorityGateWaiterEntry>,
+    high_queue: VecDeque<PriorityGateWaiterEntry>,
+    normal_queue: VecDeque<PriorityGateWaiterEntry>,
+}
+
+struct PriorityGateWaiterEntry {
+    id: u64,
+    notify: Arc<Notify>,
 }
 
 struct PriorityGatePermit {
@@ -284,6 +325,8 @@ struct PriorityGatePermit {
 struct PriorityGateWaiter {
     gate: Arc<PriorityGate>,
     priority: HostRequestPriority,
+    id: u64,
+    notify: Arc<Notify>,
     queued: bool,
 }
 
@@ -291,74 +334,121 @@ impl PriorityGate {
     fn new() -> Self {
         Self {
             state: ParkingMutex::new(PriorityGateState::default()),
-            notify: Notify::new(),
         }
     }
 
     async fn acquire(self: &Arc<Self>, priority: HostRequestPriority) -> PriorityGatePermit {
-        self.add_waiter(priority);
+        let Some((id, notify)) = self.add_waiter(priority) else {
+            return PriorityGatePermit {
+                gate: Arc::clone(self),
+            };
+        };
+
         let mut waiter = PriorityGateWaiter {
             gate: Arc::clone(self),
             priority,
+            id,
+            notify,
             queued: true,
         };
 
         loop {
-            let notified = self.notify.notified();
-            if self.try_acquire(priority) {
+            waiter.notify.notified().await;
+            if self.accept_grant(waiter.id) {
                 waiter.queued = false;
                 return PriorityGatePermit {
                     gate: Arc::clone(self),
                 };
             }
-            notified.await;
         }
     }
 
-    fn add_waiter(&self, priority: HostRequestPriority) {
+    fn add_waiter(&self, priority: HostRequestPriority) -> Option<(u64, Arc<Notify>)> {
         let mut state = self.state.lock();
+        if !state.active {
+            state.active = true;
+            return None;
+        }
+
+        let id = state.next_waiter_id;
+        state.next_waiter_id = state.next_waiter_id.wrapping_add(1);
+        let notify = Arc::new(Notify::new());
+        let entry = PriorityGateWaiterEntry {
+            id,
+            notify: Arc::clone(&notify),
+        };
         match priority {
-            HostRequestPriority::Immediate => state.immediate_waiters += 1,
-            HostRequestPriority::Normal => state.normal_waiters += 1,
+            HostRequestPriority::Immediate => state.immediate_queue.push_back(entry),
+            HostRequestPriority::High => state.high_queue.push_back(entry),
+            HostRequestPriority::Normal => state.normal_queue.push_back(entry),
         }
+        Some((id, notify))
     }
 
-    fn remove_waiter(&self, priority: HostRequestPriority) {
+    fn accept_grant(&self, id: u64) -> bool {
         let mut state = self.state.lock();
-        Self::remove_waiter_locked(&mut state, priority);
-    }
-
-    fn try_acquire(&self, priority: HostRequestPriority) -> bool {
-        let mut state = self.state.lock();
-        if state.active {
-            return false;
+        if state.granted_waiter_id == Some(id) {
+            state.granted_waiter_id = None;
+            return true;
         }
-        if priority == HostRequestPriority::Normal && state.immediate_waiters > 0 {
-            return false;
-        }
-
-        state.active = true;
-        Self::remove_waiter_locked(&mut state, priority);
-        true
+        false
     }
 
     fn release(&self) {
-        {
+        let notify = {
             let mut state = self.state.lock();
-            state.active = false;
+            if let Some(entry) = Self::pop_next_waiter_locked(&mut state) {
+                state.granted_waiter_id = Some(entry.id);
+                Some(entry.notify)
+            } else {
+                state.active = false;
+                None
+            }
+        };
+
+        if let Some(notify) = notify {
+            notify.notify_one();
         }
-        self.notify.notify_waiters();
     }
 
-    fn remove_waiter_locked(state: &mut PriorityGateState, priority: HostRequestPriority) {
-        match priority {
-            HostRequestPriority::Immediate => {
-                state.immediate_waiters = state.immediate_waiters.saturating_sub(1)
+    fn cancel_waiter(&self, priority: HostRequestPriority, id: u64) -> bool {
+        let mut release_needed = false;
+        {
+            let mut state = self.state.lock();
+            if Self::remove_waiter_locked(&mut state, priority, id) {
+                return false;
             }
-            HostRequestPriority::Normal => {
-                state.normal_waiters = state.normal_waiters.saturating_sub(1)
+            if state.granted_waiter_id == Some(id) {
+                state.granted_waiter_id = None;
+                release_needed = true;
             }
         }
+        release_needed
+    }
+
+    fn pop_next_waiter_locked(state: &mut PriorityGateState) -> Option<PriorityGateWaiterEntry> {
+        state
+            .immediate_queue
+            .pop_front()
+            .or_else(|| state.high_queue.pop_front())
+            .or_else(|| state.normal_queue.pop_front())
+    }
+
+    fn remove_waiter_locked(
+        state: &mut PriorityGateState,
+        priority: HostRequestPriority,
+        id: u64,
+    ) -> bool {
+        let queue = match priority {
+            HostRequestPriority::Immediate => &mut state.immediate_queue,
+            HostRequestPriority::High => &mut state.high_queue,
+            HostRequestPriority::Normal => &mut state.normal_queue,
+        };
+        let Some(index) = queue.iter().position(|entry| entry.id == id) else {
+            return false;
+        };
+        queue.remove(index);
+        true
     }
 }
 
@@ -370,9 +460,8 @@ impl Drop for PriorityGatePermit {
 
 impl Drop for PriorityGateWaiter {
     fn drop(&mut self) {
-        if self.queued {
-            self.gate.remove_waiter(self.priority);
-            self.gate.notify.notify_waiters();
+        if self.queued && self.gate.cancel_waiter(self.priority, self.id) {
+            self.gate.release();
         }
     }
 }
@@ -444,8 +533,48 @@ impl TranslatorHost {
         ) {
             self.web_backend.start(mode).await?;
         }
+        if mode == TranslationMode::GeminiCli && self.settings.read().maximum_usage_mode_enabled {
+            self.web_backend.start(TranslationMode::WebView).await?;
+        }
         self.start_ivlyrics_study_cli_preload_if_needed(mode);
         Ok(())
+    }
+
+    pub async fn reset_webview_profiles(&self) -> Result<WebProfileResetResult, HostError> {
+        let mode = self.mode();
+        let restart_mode = matches!(
+            mode,
+            TranslationMode::WebView | TranslationMode::ChatGptWebView
+        )
+        .then_some(mode);
+
+        if restart_mode.is_some() {
+            self.activate_request_guard("webview-profile-reset");
+        }
+
+        self.logs.push(format!(
+            "[Host] WebView profile reset start (restartMode={})",
+            restart_mode.map(TranslationMode::label).unwrap_or("none")
+        ));
+
+        let _permit = tokio::time::timeout(
+            Duration::from_secs(30),
+            self.translate_lock.acquire(HostRequestPriority::Immediate),
+        )
+        .await
+        .map_err(|_| {
+            HostError::Internal(
+                "진행 중인 WebView 요청이 끝나지 않아 프로필 초기화를 중단했습니다.".to_owned(),
+            )
+        })?;
+
+        let result = self.web_backend.reset_profiles(restart_mode).await?;
+        self.logs.push(format!(
+            "[Host] WebView profile reset complete (deletedExistingData={}, path={})",
+            result.deleted_existing_data,
+            result.webview_data_dir.display()
+        ));
+        Ok(result)
     }
 
     pub fn mode(&self) -> TranslationMode {
@@ -494,6 +623,34 @@ impl TranslatorHost {
         model_override: Option<&str>,
     ) -> Result<String, HostError> {
         self.forward_to_backend(prompt, timeout, model_override)
+            .await
+    }
+
+    pub async fn send_raw_prompt_to_webview_provider(
+        &self,
+        provider: WebViewProvider,
+        prompt: &str,
+        timeout: Duration,
+    ) -> Result<String, HostError> {
+        if provider == WebViewProvider::Current {
+            return self.send_raw_prompt(prompt, timeout).await;
+        }
+
+        self.request_guard.throw_if_active()?;
+        let _guard = self
+            .translate_lock
+            .acquire(HostRequestPriority::Normal)
+            .await;
+        self.request_guard.throw_if_active()?;
+
+        let settings = self.settings.read().clone();
+        let mode = provider.mode(self.mode());
+        self.logs.push(format!(
+            "[Host] forced WebView provider route provider={} mode={}",
+            provider.label(),
+            mode.label()
+        ));
+        self.send_web_backend_once(mode, prompt, timeout, &settings)
             .await
     }
 
@@ -891,29 +1048,78 @@ impl TranslatorHost {
 
         let settings = self.settings.read().clone();
         let mode = self.mode();
+        let maximum_usage = settings.maximum_usage_mode_enabled
+            && matches!(mode, TranslationMode::WebView | TranslationMode::GeminiCli);
+
         if matches!(
             mode,
             TranslationMode::WebView | TranslationMode::ChatGptWebView
         ) {
             let result = self
-                .web_backend
-                .send_prompt(mode, prompt, timeout, &settings)
+                .send_web_backend_once(mode, prompt, timeout, &settings)
                 .await;
-            match &result {
-                Ok(text) => self.logs.push(format!(
-                    "[Host] WebView 응답 수신 (mode={}, len={})",
-                    mode.label(),
-                    text.len()
-                )),
-                Err(error) => self.logs.push(format!(
-                    "[Host] WebView 백엔드 오류 (mode={}): {}",
-                    mode.label(),
-                    error.message
-                )),
+            if maximum_usage && is_maximum_usage_fallback_candidate(result.as_ref().err()) {
+                if let Err(error) = &result {
+                    self.logs.push(format!(
+                        "[Host] maximum usage WebView fallback to CLI: {error}"
+                    ));
+                }
+                return self
+                    .send_cli_backend_once(prompt, timeout, model_override, &settings)
+                    .await;
             }
-            return Ok(result?);
+            return result;
         }
 
+        let result = self
+            .send_cli_backend_once(prompt, timeout, model_override, &settings)
+            .await;
+        if maximum_usage && is_maximum_usage_fallback_candidate(result.as_ref().err()) {
+            if let Err(error) = &result {
+                self.logs.push(format!(
+                    "[Host] maximum usage CLI fallback to WebView: {error}"
+                ));
+            }
+            return self
+                .send_web_backend_once(TranslationMode::WebView, prompt, timeout, &settings)
+                .await;
+        }
+        result
+    }
+
+    async fn send_web_backend_once(
+        &self,
+        mode: TranslationMode,
+        prompt: &str,
+        timeout: Duration,
+        settings: &AppSettings,
+    ) -> Result<String, HostError> {
+        let result = self
+            .web_backend
+            .send_prompt(mode, prompt, timeout, settings)
+            .await;
+        match &result {
+            Ok(text) => self.logs.push(format!(
+                "[Host] WebView response received (mode={}, len={})",
+                mode.label(),
+                text.len()
+            )),
+            Err(error) => self.logs.push(format!(
+                "[Host] WebView backend error (mode={}): {}",
+                mode.label(),
+                error.message
+            )),
+        }
+        Ok(result?)
+    }
+
+    async fn send_cli_backend_once(
+        &self,
+        prompt: &str,
+        timeout: Duration,
+        model_override: Option<&str>,
+        settings: &AppSettings,
+    ) -> Result<String, HostError> {
         let selected_model = model_override
             .and_then(model_catalog::find_cli)
             .map(|model| model.id.to_owned())
@@ -922,21 +1128,208 @@ impl TranslatorHost {
             selected_model,
             timeout.as_secs().max(settings.gemini_cli_timeout_seconds),
         )
-        .with_fast_wrapper_from_settings(&settings)
+        .with_fast_wrapper_from_settings(settings)
         .with_max_output_tokens(ivlyrics_raw_max_output_tokens(prompt));
+
+        if let Some(prompt_chunks) = try_build_general_cli_prompt_chunks(prompt) {
+            let operation_timeout = scale_timeout(timeout, prompt_chunks.len());
+            self.logs.push(format!(
+                "[Host] general CLI prompt chunking start (chunks={}, budgetTokens~{}, originalTokens~{}, timeoutSec={:.0})",
+                prompt_chunks.len(),
+                GENERAL_CLI_PROMPT_TOKEN_BUDGET,
+                estimate_tokens(prompt),
+                operation_timeout.as_secs_f64()
+            ));
+
+            let send_chunks = async {
+                let mut results = Vec::with_capacity(prompt_chunks.len());
+                for (index, chunk) in prompt_chunks.iter().enumerate() {
+                    self.logs.push(format!(
+                        "[Host] general CLI chunk {}/{} send (tokens~{}, len={})",
+                        index + 1,
+                        prompt_chunks.len(),
+                        estimate_tokens(chunk),
+                        utf16_len(chunk)
+                    ));
+                    results.push(client.send_prompt(chunk).await?);
+                }
+                Ok::<_, GeminiCliError>(join_cli_chunk_results(&results))
+            };
+
+            let result = tokio::time::timeout(operation_timeout, send_chunks)
+                .await
+                .unwrap_or_else(|_| Err(gemini_cli_timeout_error()));
+            match &result {
+                Ok(text) => self.logs.push(format!(
+                    "[Host] CLI chunked response received (mode={}, chunks={}, len={})",
+                    self.mode().label(),
+                    prompt_chunks.len(),
+                    text.len()
+                )),
+                Err(error) => self.logs.push(format!(
+                    "[Host] CLI chunked backend error: {}",
+                    describe_error(error)
+                )),
+            }
+            return Ok(result?);
+        }
 
         let result = client.send_prompt(prompt).await;
         match &result {
             Ok(text) => self.logs.push(format!(
-                "[Host] CLI 응답 수신 (mode={}, len={})",
+                "[Host] CLI response received (mode={}, len={})",
                 self.mode().label(),
                 text.len()
             )),
-            Err(error) => self
-                .logs
-                .push(format!("[Host] CLI 백엔드 오류: {}", describe_error(error))),
+            Err(error) => self.logs.push(format!(
+                "[Host] CLI backend error: {}",
+                describe_error(error)
+            )),
         }
         Ok(result?)
+    }
+}
+
+fn gemini_cli_timeout_error() -> GeminiCliError {
+    GeminiCliError {
+        error_type: CliErrorType::Timeout,
+        message: "Gemini CLI timeout".to_owned(),
+        suggested_http_status: 504,
+        retryable: true,
+    }
+}
+
+fn scale_timeout(timeout: Duration, chunk_count: usize) -> Duration {
+    if chunk_count <= 1 || timeout.is_zero() {
+        return timeout;
+    }
+
+    let multiplier = chunk_count.min(12) as u32;
+    timeout.saturating_mul(multiplier)
+}
+
+fn try_build_general_cli_prompt_chunks(prompt: &str) -> Option<Vec<String>> {
+    if prompt.trim().is_empty()
+        || estimate_tokens(prompt) <= GENERAL_CLI_PROMPT_TOKEN_BUDGET
+        || ivlyrics::try_detect_lyrics_study_category(prompt).is_some()
+    {
+        return None;
+    }
+
+    let chunks = try_split_input_lines_prompt(prompt)?;
+    if chunks.len() > 1 { Some(chunks) } else { None }
+}
+
+fn try_split_input_lines_prompt(prompt: &str) -> Option<Vec<String>> {
+    let start_marker_index = prompt.find(INPUT_LINES_START_MARKER)?;
+    let input_start = skip_line_break(prompt, start_marker_index + INPUT_LINES_START_MARKER.len());
+    let relative_end = prompt[input_start..].find(INPUT_LINES_END_MARKER)?;
+    let end_marker_index = input_start + relative_end;
+    if end_marker_index <= input_start {
+        return None;
+    }
+
+    let header = ensure_ends_with_line_break(&prompt[..input_start]);
+    let footer = &prompt[end_marker_index..];
+    let used_chars = utf16_len(&header) + utf16_len(footer);
+    let available_chars = GENERAL_CLI_PROMPT_CHAR_BUDGET.checked_sub(used_chars)?;
+    if available_chars < 1000 {
+        return None;
+    }
+
+    let lines_block = trim_trailing_line_breaks(&prompt[input_start..end_marker_index]);
+    let normalized = lines_block.replace("\r\n", "\n").replace('\r', "\n");
+    let lines = normalized.split('\n').collect::<Vec<_>>();
+    if lines.len() <= 1 {
+        return None;
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut current_chars = 0usize;
+    for line in lines {
+        let line_chars = utf16_len(line) + 1;
+        if !current.is_empty() && current_chars + line_chars > available_chars {
+            chunks.push(build_input_lines_chunk(&header, footer, &current));
+            current.clear();
+            current_chars = 0;
+        }
+
+        current.push(line.to_owned());
+        current_chars += line_chars;
+    }
+
+    if !current.is_empty() {
+        chunks.push(build_input_lines_chunk(&header, footer, &current));
+    }
+
+    Some(chunks)
+}
+
+fn build_input_lines_chunk(header: &str, footer: &str, lines: &[String]) -> String {
+    format!("{}{}\n{}", header, lines.join("\n"), footer)
+}
+
+fn join_cli_chunk_results(results: &[String]) -> String {
+    results
+        .iter()
+        .map(|result| result.trim_end_matches(['\r', '\n']))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end_matches(['\r', '\n'])
+        .to_owned()
+}
+
+fn estimate_tokens(text: &str) -> usize {
+    let len = utf16_len(text);
+    if len == 0 {
+        0
+    } else {
+        len.div_ceil(APPROX_CHARS_PER_TOKEN).max(1)
+    }
+}
+
+fn skip_line_break(value: &str, mut index: usize) -> usize {
+    let bytes = value.as_bytes();
+    if index < bytes.len() && bytes[index] == b'\r' {
+        index += 1;
+    }
+    if index < bytes.len() && bytes[index] == b'\n' {
+        index += 1;
+    }
+    index
+}
+
+fn ensure_ends_with_line_break(value: &str) -> String {
+    if value.ends_with('\n') || value.ends_with('\r') {
+        value.to_owned()
+    } else {
+        format!("{value}\n")
+    }
+}
+
+fn trim_trailing_line_breaks(value: &str) -> &str {
+    value.trim_end_matches(['\r', '\n'])
+}
+
+fn utf16_len(value: &str) -> usize {
+    value.encode_utf16().count()
+}
+
+fn is_maximum_usage_fallback_candidate(error: Option<&HostError>) -> bool {
+    match error {
+        Some(HostError::Cli(error)) => matches!(
+            error.error_type,
+            CliErrorType::RateLimited
+                | CliErrorType::Timeout
+                | CliErrorType::ProcessCrash
+                | CliErrorType::UpdateTransient
+                | CliErrorType::EmptyResponse
+                | CliErrorType::Unknown
+        ),
+        Some(HostError::Web(error)) => matches!(error.status, 429 | 503 | 504),
+        Some(HostError::Internal(_)) => true,
+        Some(HostError::Guard(_)) | None => false,
     }
 }
 
@@ -1106,5 +1499,137 @@ mod tests {
         assert!(cleared.try_get_fallback_cooldown().is_some());
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn general_cli_prompt_chunking_matches_input_lines_contract() {
+        let line = "0123456789".repeat(200);
+        let lines = (0..40)
+            .map(|index| format!("{index}:{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = format!(
+            "HEADER\n{INPUT_LINES_START_MARKER}\n{lines}\n{INPUT_LINES_END_MARKER}\nFOOTER"
+        );
+
+        let chunks = try_build_general_cli_prompt_chunks(&prompt).unwrap();
+        assert!(chunks.len() > 1);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.starts_with("HEADER\nINPUT_LINES_START\n"))
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.ends_with("INPUT_LINES_END\nFOOTER"))
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| estimate_tokens(chunk) <= GENERAL_CLI_PROMPT_TOKEN_BUDGET + 1)
+        );
+    }
+
+    #[test]
+    fn general_cli_prompt_chunking_keeps_short_or_unknown_shapes_single() {
+        assert!(try_build_general_cli_prompt_chunks("short").is_none());
+        assert!(
+            try_build_general_cli_prompt_chunks(&"x".repeat(GENERAL_CLI_PROMPT_CHAR_BUDGET + 10))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn general_cli_chunk_join_trims_like_csharp_host() {
+        let joined =
+            join_cli_chunk_results(&["a\r\n".to_owned(), "b\n\n".to_owned(), "c".to_owned()]);
+
+        assert_eq!(joined, "a\nb\nc");
+    }
+
+    #[tokio::test]
+    async fn priority_gate_releases_immediate_then_high_then_normal() {
+        let gate = Arc::new(PriorityGate::new());
+        let first = gate.acquire(HostRequestPriority::Normal).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_normal_tx, release_normal_rx) = tokio::sync::oneshot::channel();
+        let (release_high_tx, release_high_rx) = tokio::sync::oneshot::channel();
+        let (release_immediate_tx, release_immediate_rx) = tokio::sync::oneshot::channel();
+
+        spawn_gate_waiter(
+            Arc::clone(&gate),
+            HostRequestPriority::Normal,
+            "normal",
+            tx.clone(),
+            release_normal_rx,
+        );
+        spawn_gate_waiter(
+            Arc::clone(&gate),
+            HostRequestPriority::High,
+            "high",
+            tx.clone(),
+            release_high_rx,
+        );
+        spawn_gate_waiter(
+            Arc::clone(&gate),
+            HostRequestPriority::Immediate,
+            "immediate",
+            tx,
+            release_immediate_rx,
+        );
+        tokio::task::yield_now().await;
+
+        drop(first);
+        assert_eq!(rx.recv().await, Some("immediate"));
+        let _ = release_immediate_tx.send(());
+        assert_eq!(rx.recv().await, Some("high"));
+        let _ = release_high_tx.send(());
+        assert_eq!(rx.recv().await, Some("normal"));
+        let _ = release_normal_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn priority_gate_cancelled_waiter_does_not_block_next() {
+        let gate = Arc::new(PriorityGate::new());
+        let first = gate.acquire(HostRequestPriority::Normal).await;
+        let cancelled = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move {
+                let _permit = gate.acquire(HostRequestPriority::Immediate).await;
+            }
+        });
+        tokio::task::yield_now().await;
+        cancelled.abort();
+        let _ = cancelled.await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        spawn_gate_waiter(
+            Arc::clone(&gate),
+            HostRequestPriority::Normal,
+            "next",
+            tx,
+            release_rx,
+        );
+        tokio::task::yield_now().await;
+
+        drop(first);
+        assert_eq!(rx.recv().await, Some("next"));
+        let _ = release_tx.send(());
+    }
+
+    fn spawn_gate_waiter(
+        gate: Arc<PriorityGate>,
+        priority: HostRequestPriority,
+        label: &'static str,
+        tx: tokio::sync::mpsc::UnboundedSender<&'static str>,
+        release_rx: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        tokio::spawn(async move {
+            let _permit = gate.acquire(priority).await;
+            tx.send(label).unwrap();
+            let _ = release_rx.await;
+        });
     }
 }

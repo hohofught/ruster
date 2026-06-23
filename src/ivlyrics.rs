@@ -2,6 +2,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::diagnostics;
+use crate::host::WebViewProvider;
 use crate::prompt_config::PromptConfig;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +22,7 @@ pub struct IvLyricsPromptRewriteResult {
     pub strip_number_tags_from_response: bool,
     pub source_lines: Vec<String>,
     pub original_prompt: String,
+    pub preferred_provider: WebViewProvider,
 }
 
 #[derive(Clone, Debug)]
@@ -112,6 +114,7 @@ pub fn try_rewrite_translation(
         strip_number_tags_from_response: true,
         source_lines: Vec::new(),
         original_prompt: prompt.to_owned(),
+        preferred_provider: WebViewProvider::Current,
     })
 }
 
@@ -155,6 +158,7 @@ pub fn try_rewrite_phonetic(
         strip_number_tags_from_response: true,
         source_lines,
         original_prompt: prompt.to_owned(),
+        preferred_provider: WebViewProvider::Current,
     })
 }
 
@@ -223,6 +227,7 @@ Input lines JSON:\n{input_lines_json}"
         strip_number_tags_from_response: false,
         source_lines: Vec::new(),
         original_prompt: prompt.to_owned(),
+        preferred_provider: WebViewProvider::Current,
     })
 }
 

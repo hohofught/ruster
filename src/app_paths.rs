@@ -62,10 +62,13 @@ impl AppPaths {
         self.data_dir.join("PromptPresets")
     }
 
+    pub fn webview_data_dir(&self) -> PathBuf {
+        self.data_dir.join("WebView2")
+    }
+
     #[allow(dead_code)]
     pub fn webview_user_data_dir(&self, profile_name: &str) -> PathBuf {
-        self.data_dir
-            .join("WebView2")
+        self.webview_data_dir()
             .join(sanitize_path_segment(profile_name))
     }
 }
@@ -142,5 +145,23 @@ mod tests {
             "Gemini_ChatGPT_"
         );
         assert_eq!(sanitize_path_segment("   "), "Default");
+    }
+
+    #[test]
+    fn webview_paths_match_csharp_profile_layout() {
+        let paths = AppPaths {
+            executable_dir: PathBuf::from("app"),
+            data_dir: PathBuf::from("data"),
+            using_portable_data: false,
+        };
+
+        assert_eq!(
+            paths.webview_data_dir(),
+            PathBuf::from("data").join("WebView2")
+        );
+        assert_eq!(
+            paths.webview_user_data_dir("Gemini"),
+            PathBuf::from("data").join("WebView2").join("Gemini")
+        );
     }
 }

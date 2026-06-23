@@ -37,6 +37,7 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::oneshot;
 
 use crate::app_paths::AppPaths;
+use crate::cli::GeminiCliClient;
 use crate::fast_client::FastGenerationConfig;
 use crate::gui::GuiExitAction;
 use crate::host::{TranslationMode, TranslatorHost};
@@ -164,7 +165,50 @@ fn parse_mode_value(value: &str) -> Option<TranslationMode> {
 }
 
 async fn run_cli_probe(settings: AppSettings) -> Result<()> {
-    let model = model_catalog::normalize_cli_model(&settings.gemini_cli_model);
+    let model = model_catalog::apply_cli_thinking_level(
+        &settings.gemini_cli_model,
+        &settings.gemini_fast_thinking_level,
+    );
+    if cli_discovery::should_use_antigravity_fast_backend() {
+        println!("[CLI Probe] Antigravity native CLI probe start (model={model})");
+        let installation = cli_discovery::try_find();
+        let client = GeminiCliClient::new(model.clone(), 60)
+            .with_fast_wrapper_from_settings(&settings)
+            .with_fast_wrapper_native_fallback(false)
+            .with_retry_attempts(1);
+        match client.send_prompt("Say OK.").await {
+            Ok(response) => {
+                let ready = response.to_ascii_uppercase().contains("OK");
+                println!("[CLI Probe] CLI installed: {}", installation.is_some());
+                println!(
+                    "[CLI Probe] CLI detail: {}",
+                    installation
+                        .map(|value| value.display_source())
+                        .unwrap_or_default()
+                );
+                println!("[CLI Probe] Wrapper ready: {ready}");
+                println!("[CLI Probe] Source: antigravity-native-cli");
+                println!("[CLI Probe] Abuse/policy signal: false");
+                println!(
+                    "[CLI Probe] Response: {}",
+                    logging::summarize_text(&response, 160)
+                );
+                if ready {
+                    return Ok(());
+                }
+                std::process::exit(2);
+            }
+            Err(error) => {
+                println!("[CLI Probe] CLI installed: {}", installation.is_some());
+                println!("[CLI Probe] Wrapper ready: false");
+                println!("[CLI Probe] Source: antigravity-native-cli");
+                println!("[CLI Probe] Abuse/policy signal: false");
+                println!("[CLI Probe] Error: {}", error.message);
+                std::process::exit(2);
+            }
+        }
+    }
+
     println!("[CLI Probe] Gemini Rust wrapper probe start (model={model})");
 
     let result = fast_client::probe(
@@ -212,7 +256,7 @@ async fn run_webview_smoke(
         settings.clone(),
         logs.clone(),
         mode,
-        paths.webview_user_data_dir("profiles"),
+        paths.webview_data_dir(),
         paths.ivlyrics_study_limit_guard_path(),
     ));
 
@@ -267,7 +311,7 @@ async fn run_headless(
         settings.clone(),
         logs.clone(),
         mode,
-        paths.webview_user_data_dir("profiles"),
+        paths.webview_data_dir(),
         paths.ivlyrics_study_limit_guard_path(),
     ));
     host.start().await?;

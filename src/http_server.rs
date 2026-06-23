@@ -20,7 +20,7 @@ use crate::app_paths::AppPaths;
 use crate::auto_prompt;
 use crate::custom_api::{self, CustomApiPresetService};
 use crate::diagnostics;
-use crate::host::{HostError, TranslatorHost};
+use crate::host::{HostError, TranslationMode, TranslatorHost, WebViewProvider};
 use crate::ivlyrics;
 use crate::ivlyrics_gate::IvLyricsGate;
 use crate::ivlyrics_repair;
@@ -598,6 +598,7 @@ async fn forward_prompt_with_options(
     cli_route: Option<ivlyrics::IvLyricsPromptKind>,
     model_override: Option<&str>,
     translation_target: Option<&str>,
+    preferred_provider: WebViewProvider,
 ) -> Result<String, HostError> {
     if let Some(kind) = cli_route {
         let request_id = diagnostics::next_request_id();
@@ -636,6 +637,17 @@ async fn forward_prompt_with_options(
     let request_id = diagnostics::next_request_id();
     let host = state.host.clone();
     let model_override = model_override.map(ToOwned::to_owned);
+    if preferred_provider != WebViewProvider::Current {
+        let provider = preferred_provider;
+        let key = format!("{key}:provider:{}", provider.label());
+        return state
+            .dedup
+            .run(key, "Forward", request_id, mode, move || async move {
+                host.send_raw_prompt_to_webview_provider(provider, &backend_prompt, timeout)
+                    .await
+            })
+            .await;
+    }
 
     state
         .dedup
@@ -735,11 +747,12 @@ async fn prepare_prompt_for_forwarding(
             .await;
             let result = ivlyrics::IvLyricsPromptRewriteResult {
                 kind: ivlyrics::IvLyricsPromptKind::Translation,
-                prompt: rewritten,
+                prompt: rewritten.prompt,
                 line_count: input.line_count,
                 strip_number_tags_from_response: true,
                 source_lines: Vec::new(),
                 original_prompt: prompt.to_owned(),
+                preferred_provider: rewritten.preferred_provider,
             };
             return (result.prompt.clone(), Some(result), detected_kind);
         }
@@ -846,6 +859,21 @@ fn select_ivlyrics_study_raw_prompt<'a>(primary: &'a str, fallback: &'a str) -> 
     } else {
         fallback
     }
+}
+
+fn preferred_provider_for_forward(
+    state: &ServerState,
+    rewrite: Option<&ivlyrics::IvLyricsPromptRewriteResult>,
+    cli_route: Option<ivlyrics::IvLyricsPromptKind>,
+) -> WebViewProvider {
+    if cli_route.is_some() || state.host.mode() == TranslationMode::GeminiCli {
+        return WebViewProvider::Current;
+    }
+
+    rewrite
+        .filter(|rewrite| rewrite.kind == ivlyrics::IvLyricsPromptKind::Translation)
+        .map(|rewrite| rewrite.preferred_provider)
+        .unwrap_or(WebViewProvider::Current)
 }
 
 fn map_host_error(
@@ -1076,6 +1104,7 @@ async fn handle_openai_chat(state: &ServerState, path: &str, root: &Value) -> Re
         cli_route,
         Some(&model),
         None,
+        preferred_provider_for_forward(state, rewrite.as_ref(), cli_route),
     )
     .await
     {
@@ -1221,6 +1250,7 @@ async fn handle_openai_responses(state: &ServerState, root: &Value) -> Response<
         cli_route,
         Some(&model),
         None,
+        preferred_provider_for_forward(state, rewrite.as_ref(), cli_route),
     )
     .await
     {
@@ -1355,6 +1385,7 @@ async fn handle_openai_completions(state: &ServerState, root: &Value) -> Respons
         cli_route,
         Some(&model),
         None,
+        preferred_provider_for_forward(state, rewrite.as_ref(), cli_route),
     )
     .await
     {
@@ -1620,6 +1651,7 @@ async fn handle_gemini(
         cli_route,
         Some(&requested_model),
         None,
+        preferred_provider_for_forward(state, rewrite.as_ref(), cli_route),
     )
     .await
     {
@@ -1875,6 +1907,7 @@ async fn handle_mort(
             cli_route,
             None,
             Some(&incoming.result_code),
+            WebViewProvider::Current,
         )
         .await
     };
@@ -2030,6 +2063,7 @@ async fn normalize_forwarded_ivlyrics_result(
                     None,
                     None,
                     None,
+                    WebViewProvider::Current,
                 )
                 .await
                 .map_err(|error| error.to_string())

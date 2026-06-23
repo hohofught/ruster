@@ -5,6 +5,7 @@ use std::time::Duration;
 use regex::{Captures, Regex};
 use serde_json::{Map, Value, json};
 
+use crate::host::WebViewProvider;
 use crate::ivlyrics::{self, IvLyricsPromptKind, IvLyricsPromptRewriteResult};
 use crate::prompt_config::PromptConfig;
 
@@ -444,6 +445,7 @@ pub fn normalize_study_json_or_empty(response: &str, category: &str) -> (String,
             strip_number_tags_from_response: false,
             source_lines: Vec::new(),
             original_prompt: String::new(),
+            preferred_provider: WebViewProvider::Current,
         };
         if let Ok(normalized) = try_normalize_quiz_json(response, &rewrite) {
             return (normalized, false, String::new());
@@ -1097,6 +1099,7 @@ mod tests {
             original_prompt:
                 "Convert these 2 lines of lyrics to pronunciation\nINPUT:\n春\n愛\nOUTPUT (2 lines)"
                     .to_owned(),
+            preferred_provider: WebViewProvider::Current,
         }
     }
 
@@ -1148,6 +1151,7 @@ mod tests {
             source_lines: Vec::new(),
             original_prompt: "Input lines JSON:\n[{\"index\":3,\"text\":\"夜に駆ける\"}]"
                 .to_owned(),
+            preferred_provider: WebViewProvider::Current,
         };
         let normalized = try_normalize_quiz_json(
             "```json\n{\"questions\":[{\"prompt\":\"뜻은?\",\"options\":{\"A\":\"밤으로 달려\",\"B\":\"아침\"},\"correct\":\"A\",\"kind\":\"meaning\",\"index\":3}]}\n```",
@@ -1171,6 +1175,7 @@ mod tests {
             source_lines: Vec::new(),
             original_prompt: "Input lines JSON:\n[{\"index\":8,\"text\":\"惨めな馬鹿女って\"}]"
                 .to_owned(),
+            preferred_provider: WebViewProvider::Current,
         };
         let normalized = try_normalize_quiz_json(
             r#"{
@@ -1205,6 +1210,7 @@ mod tests {
             strip_number_tags_from_response: false,
             source_lines: Vec::new(),
             original_prompt: "Input lines JSON:\n[{\"index\":1,\"text\":\"hello\"}]".to_owned(),
+            preferred_provider: WebViewProvider::Current,
         };
         let normalized = try_normalize_quiz_json(
             r#"[

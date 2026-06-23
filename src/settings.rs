@@ -35,13 +35,16 @@ pub struct AppSettings {
     pub iv_lyrics_phonetic_use_chat_gpt_web_view_enabled: Option<bool>,
     pub iv_lyrics_quiz_cli_model: String,
     pub gemini_cli_use_fast_wrapper: bool,
+    pub maximum_usage_mode_enabled: bool,
     pub iv_lyrics_quiz_fast_cli_wrapper_enabled: bool,
     pub gemini_fast_thinking_level: String,
     pub gemini_fast_thinking_budget: i32,
     pub verbose_logs: bool,
     pub web_view_refresh_every_requests: u32,
+    pub web_view_instance_count: u32,
     pub web_view_pure_quality_mode: bool,
     pub web_view_raw_mode: bool,
+    pub web_view_parallel_processing_enabled: bool,
     pub web_view_idle_refresh_seconds: u32,
     pub theme_mode: String,
     pub ui_language: String,
@@ -75,13 +78,16 @@ impl Default for AppSettings {
             iv_lyrics_phonetic_use_chat_gpt_web_view_enabled: None,
             iv_lyrics_quiz_cli_model: model_catalog::DEFAULT_CLI_MODEL_ID.to_owned(),
             gemini_cli_use_fast_wrapper: true,
+            maximum_usage_mode_enabled: false,
             iv_lyrics_quiz_fast_cli_wrapper_enabled: true,
             gemini_fast_thinking_level: "LOW".to_owned(),
             gemini_fast_thinking_budget: 2048,
             verbose_logs: true,
             web_view_refresh_every_requests: 1,
+            web_view_instance_count: 1,
             web_view_pure_quality_mode: true,
             web_view_raw_mode: false,
+            web_view_parallel_processing_enabled: false,
             web_view_idle_refresh_seconds: 60,
             theme_mode: "System".to_owned(),
             ui_language: "Korean".to_owned(),
@@ -152,7 +158,9 @@ impl AppSettings {
             return;
         }
 
-        let selected = model_catalog::normalize_cli_model(selected_model);
+        let selected = model_catalog::find_cli(selected_model)
+            .map(|model| model.id.to_owned())
+            .unwrap_or_else(|| model_catalog::normalize_cli_model(selected_model));
         let selected = if normalized
             .iter()
             .any(|model| model.eq_ignore_ascii_case(&selected))
@@ -194,6 +202,7 @@ impl AppSettings {
         self.gemini_cli_verified_model_ids =
             normalize_gemini_cli_verified_model_ids(&self.gemini_cli_verified_model_ids);
         self.web_view_refresh_every_requests = self.web_view_refresh_every_requests.clamp(1, 200);
+        self.web_view_instance_count = clamp_web_view_instance_count(self.web_view_instance_count);
         self.web_view_idle_refresh_seconds = self.web_view_idle_refresh_seconds.clamp(10, 600);
         self.theme_mode = normalize_theme_mode(&self.theme_mode);
         self.ui_language = normalize_ui_language(&self.ui_language);
@@ -234,7 +243,9 @@ fn normalize_gemini_cli_verified_model_ids(
 ) -> Vec<String> {
     let mut out = Vec::new();
     for model in model_ids {
-        let normalized = model_catalog::normalize_cli_model(model.as_ref());
+        let normalized = model_catalog::find_cli(model.as_ref())
+            .map(|model| model.id.to_owned())
+            .unwrap_or_else(|| model_catalog::normalize_cli_model(model.as_ref()));
         if model_catalog::find_cli(&normalized).is_none() {
             continue;
         }
@@ -274,6 +285,10 @@ pub fn normalize_translation_mode(mode: &str) -> String {
         _ => "WebView",
     }
     .to_owned()
+}
+
+pub fn clamp_web_view_instance_count(value: u32) -> u32 {
+    value.clamp(1, 5)
 }
 
 pub fn generate_local_api_key() -> String {
@@ -347,6 +362,7 @@ mod tests {
             iv_lyrics_quiz_fast_cli_wrapper_enabled: true,
             gemini_cli_timeout_seconds: 0,
             web_view_refresh_every_requests: 0,
+            web_view_instance_count: 0,
             web_view_idle_refresh_seconds: 1,
             local_api_key: "  rst-local  ".to_owned(),
             theme_mode: "dark".to_owned(),
@@ -366,6 +382,7 @@ mod tests {
         assert!(!settings.iv_lyrics_phonetic_use_cli_wrapper_enabled);
         assert_eq!(settings.gemini_cli_timeout_seconds, 5);
         assert_eq!(settings.web_view_refresh_every_requests, 1);
+        assert_eq!(settings.web_view_instance_count, 1);
         assert_eq!(settings.web_view_idle_refresh_seconds, 10);
         assert_eq!(settings.local_api_key, "rst-local");
         assert_eq!(settings.theme_mode, "Dark");

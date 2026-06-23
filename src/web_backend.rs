@@ -1,3 +1,5 @@
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +26,8 @@ const PURE_QUALITY_SESSION_REFRESH_COOLDOWN: Duration = Duration::from_secs(2);
 const SESSION_REFRESH_READY_CHECK: Duration = Duration::from_secs(5);
 const SESSION_REFRESH_STABILIZE: Duration = Duration::from_millis(1200);
 const PROTECTION_BLOCK_COOLDOWN: Duration = Duration::from_secs(60);
+const MAX_PROFILE_DELETE_ATTEMPTS: u8 = 10;
+const PROFILE_RESET_SHUTDOWN_WAIT: Duration = Duration::from_millis(350);
 
 #[derive(Clone)]
 pub struct WebAutomationBackend {
@@ -70,6 +74,12 @@ pub struct WebBackendError {
     pub retryable: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct WebProfileResetResult {
+    pub deleted_existing_data: bool,
+    pub webview_data_dir: PathBuf,
+}
+
 impl WebAutomationBackend {
     pub fn new(logs: LogBuffer, profile_root: PathBuf) -> Self {
         Self {
@@ -87,6 +97,39 @@ impl WebAutomationBackend {
     pub async fn start(&self, mode: TranslationMode) -> Result<(), WebBackendError> {
         self.ensure_session(mode).await?;
         Ok(())
+    }
+
+    pub async fn reset_profiles(
+        &self,
+        restart_mode: Option<TranslationMode>,
+    ) -> Result<WebProfileResetResult, WebBackendError> {
+        let restart_mode = restart_mode.filter(|mode| Provider::from_mode(*mode).is_ok());
+
+        let deleted_existing_data = {
+            let _launch = self.launch_lock.lock().await;
+            {
+                let mut guard = self.session.lock().await;
+                if guard.is_some() {
+                    self.logs
+                        .push("[WebView] profile reset: closing active session");
+                    *guard = None;
+                }
+            }
+            *self.last_mode.lock() = None;
+            *self.refresh_state.lock() = WebRefreshState::default();
+
+            tokio::time::sleep(PROFILE_RESET_SHUTDOWN_WAIT).await;
+            reset_profile_root(&self.profile_root, &self.logs).await?
+        };
+
+        if let Some(mode) = restart_mode {
+            self.ensure_session(mode).await?;
+        }
+
+        Ok(WebProfileResetResult {
+            deleted_existing_data,
+            webview_data_dir: self.profile_root.clone(),
+        })
     }
 
     pub fn activate_request_guard(&self, source: &str, remaining: Duration) {
@@ -2002,9 +2045,201 @@ fn web_error(message: impl Into<String>, status: u16, retryable: bool) -> WebBac
     }
 }
 
+async fn reset_profile_root(root: &Path, logs: &LogBuffer) -> Result<bool, WebBackendError> {
+    let root = full_path(root).map_err(|error| {
+        web_error(
+            format!("Failed to resolve WebView profile folder: {error}"),
+            500,
+            false,
+        )
+    })?;
+
+    if !is_safe_webview_root(&root) {
+        return Err(web_error(
+            format!("Unsafe WebView data path: {}", root.display()),
+            500,
+            false,
+        ));
+    }
+
+    let deleted_existing_data = directory_has_entries(&root).map_err(|error| {
+        web_error(
+            format!("Failed to inspect WebView profile folder: {error}"),
+            503,
+            true,
+        )
+    })?;
+
+    if root.exists() {
+        delete_directory_with_retry(&root).await.map_err(|error| {
+            web_error(
+                format!(
+                    "Failed to delete WebView profile folder. A WebView/browser process may still be shutting down: {error}"
+                ),
+                503,
+                true,
+            )
+        })?;
+    }
+
+    fs::create_dir_all(&root).map_err(|error| {
+        web_error(
+            format!("Failed to recreate empty WebView profile folder: {error}"),
+            503,
+            true,
+        )
+    })?;
+
+    logs.push(format!(
+        "[WebView] profile reset complete (deletedExistingData={}, path={})",
+        deleted_existing_data,
+        root.display()
+    ));
+    Ok(deleted_existing_data)
+}
+
+fn full_path(path: &Path) -> io::Result<PathBuf> {
+    if path.exists() {
+        fs::canonicalize(path)
+    } else if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn is_safe_webview_root(root: &Path) -> bool {
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("WebView2"))
+        && root.parent().is_some()
+}
+
+fn directory_has_entries(root: &Path) -> io::Result<bool> {
+    if !root.exists() {
+        return Ok(false);
+    }
+    let mut entries = fs::read_dir(root)?;
+    match entries.next() {
+        Some(Ok(_)) => Ok(true),
+        Some(Err(error)) => Err(error),
+        None => Ok(false),
+    }
+}
+
+async fn delete_directory_with_retry(root: &Path) -> io::Result<()> {
+    let mut last_error = None;
+
+    for attempt in 1..=MAX_PROFILE_DELETE_ATTEMPTS {
+        if !root.exists() {
+            return Ok(());
+        }
+
+        normalize_attributes(root);
+        match fs::remove_dir_all(root) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+
+        tokio::time::sleep(profile_delete_retry_delay(attempt)).await;
+    }
+
+    Err(last_error.unwrap_or_else(|| io::Error::other("delete retry failed")))
+}
+
+fn profile_delete_retry_delay(attempt: u8) -> Duration {
+    Duration::from_millis((100 + u64::from(attempt) * 160).min(1200))
+}
+
+fn normalize_attributes(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+
+    if path.is_dir() {
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                normalize_attributes(&entry.path());
+            }
+        }
+    }
+
+    if let Ok(metadata) = fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        if permissions.readonly() {
+            permissions.set_readonly(false);
+            let _ = fs::set_permissions(path, permissions);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn profile_reset_deletes_existing_webview_root_and_recreates_empty_dir() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("ruster-tests")
+            .join(uuid::Uuid::new_v4().to_string())
+            .join("WebView2");
+        let profile = root.join("Gemini");
+        fs::create_dir_all(&profile).unwrap();
+        let cookie_file = profile.join("Cookies");
+        fs::write(&cookie_file, "stale").unwrap();
+        let mut permissions = fs::metadata(&cookie_file).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&cookie_file, permissions).unwrap();
+
+        let logs = LogBuffer::new();
+        logs.set_stdout_enabled(false);
+        let deleted = reset_profile_root(&root, &logs).await.unwrap();
+
+        assert!(deleted);
+        assert!(root.exists());
+        assert!(!directory_has_entries(&root).unwrap());
+
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn profile_reset_creates_missing_webview_root_without_deleted_flag() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("ruster-tests")
+            .join(uuid::Uuid::new_v4().to_string())
+            .join("WebView2");
+        let logs = LogBuffer::new();
+        logs.set_stdout_enabled(false);
+
+        let deleted = reset_profile_root(&root, &logs).await.unwrap();
+
+        assert!(!deleted);
+        assert!(root.exists());
+        assert!(!directory_has_entries(&root).unwrap());
+
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn profile_reset_rejects_non_webview_root() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("ruster-tests")
+            .join(uuid::Uuid::new_v4().to_string())
+            .join("profiles");
+        let logs = LogBuffer::new();
+        logs.set_stdout_enabled(false);
+
+        let error = reset_profile_root(&root, &logs).await.unwrap_err();
+
+        assert!(error.message.contains("Unsafe WebView data path"));
+    }
 
     #[test]
     fn pure_quality_refreshes_every_request() {
